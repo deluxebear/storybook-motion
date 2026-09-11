@@ -4,3 +4,4 @@
 /.pipeline/**/status.json
 __pycache__/
 /url
+/.env
