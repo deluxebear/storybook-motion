@@ -1,0 +1,22 @@
+{
+  "prompt": {
+    "node": "105:104",
+    "input": "prompt"
+  },
+  "seed": {
+    "node": "105:15",
+    "input": "noise_seed"
+  },
+  "duration_seconds": {
+    "node": "105:111",
+    "input": "value"
+  },
+  "reference_image": {
+    "node": "114",
+    "input": "image"
+  },
+  "output_prefix": {
+    "node": "92",
+    "input": "filename_prefix"
+  }
+}

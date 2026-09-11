@@ -1,0 +1,5 @@
+/books/
+/.tmp_*.py
+/notebooks/*_output.ipynb
+/.pipeline/**/status.json
+__pycache__/

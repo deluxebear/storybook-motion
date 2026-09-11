@@ -1,0 +1,4 @@
+interface:
+  display_name: "Colab ComfyUI Session"
+  short_description: "Launch A100 ComfyUI and save its tunnel URL"
+  default_prompt: "Use $colab-comfyui-session to launch the project ComfyUI notebook on Colab and save its Cloudflare URL."

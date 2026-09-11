@@ -1,0 +1,4 @@
+interface:
+  display_name: "Book Dash Animation Pipeline"
+  short_description: "Automate Book Dash books into voiced MiniMax H3 animations"
+  default_prompt: "Use $bookdash-animation-pipeline with this Book Dash URL and my running ComfyUI URL to produce the animation automatically."
