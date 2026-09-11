@@ -10,10 +10,16 @@ TEMPLATE_DIR = Path(__file__).resolve().parents[1] / "templates/minimax_h3_i2v"
 
 def slug_from_url(url):
     p=urlparse(url)
-    if p.scheme not in {"http","https"} or p.netloc.lower() not in {"bookdash.org","www.bookdash.org"}:
-        raise ValueError("expected an http(s) Book Dash URL")
-    m=re.search(r"/books/([^/]+)/?",p.path)
-    if not m: raise ValueError("URL must contain /books/<slug>/")
+    if p.scheme not in {"http","https"}:
+        raise ValueError("expected an http(s) book URL")
+    host = p.netloc.lower()
+    if host in {"bookdash.org", "www.bookdash.org"}:
+        m = re.fullmatch(r"/books/([^/]+)/?", p.path)
+    elif host in {"storyweaver.org.in", "www.storyweaver.org.in"}:
+        m = re.fullmatch(r"/(?:[a-z]{2}/)?stories/(\d+-[^/]+)/?", p.path)
+    else:
+        raise ValueError("expected a Book Dash or StoryWeaver URL")
+    if not m: raise ValueError("URL must identify a Book Dash book or StoryWeaver story")
     slug=re.sub(r"[^a-z0-9-]+","-",m.group(1).lower()).strip("-")
     if not slug: raise ValueError("empty book slug")
     return slug
