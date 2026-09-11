@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 DIRS = ["source/original", "source/pages", "planning", "notebooks", "voices/candidates",
         "voices/selected", "audio/lines", "audio/mixes", "images/references", "images/shots",
         "comfyui/submissions", "video/shots", "video/final", "logs"]
-TEMPLATE_DIR = Path(__file__).resolve().parents[1] / "templates/minimax_h3_i2v"
+TEMPLATE_DIR = Path(__file__).resolve().parents[1] / "templates/ltx2_5_i2v"
 
 def slug_from_url(url):
     p=urlparse(url)

@@ -2,7 +2,7 @@
 
 Use the HTTP API with an API-format workflow against the user-supplied running endpoint. The Cloudflare URL may be ephemeral; record it in `comfyui/endpoint.json` as checked runtime metadata, but never start, restart, mount, configure, or stop the user’s ComfyUI environment.
 
-The canonical per-book workflow is `templates/minimax_h3_i2v/workflow_api.json` with its adjacent bindings. Project initialization copies both files. Validation ignores literal input values but requires identical node IDs/classes, input names, edge topology, and bindings, so prompts, images, seeds, durations, and output prefixes can vary without permitting structural drift.
+The default workflow for new books is `templates/ltx2_5_i2v/workflow_api.json` (5 seconds, 24 fps) with its adjacent bindings. Project initialization copies both files. Validation ignores literal input values but requires identical node IDs/classes, input names, edge topology, and bindings, so prompts, images, seeds, durations, and output prefixes can vary without permitting structural drift. The legacy `minimax_h3_i2v` template remains accepted for frozen existing projects.
 
 Normalize the base URL by removing its fragment and trailing slash. Require `/system_stats` before uploads. If the workflow came from another instance, compare its class types with `/object_info` and stop with the exact missing-node list.
 
@@ -30,3 +30,11 @@ The supervisor then tracks all acknowledged prompt IDs together. It obtains the 
 Count every `/prompt` POST in `post_attempts`, including uncertain responses and definitive rejections, and cap each shot at three POST attempts. Count acknowledged prompt IDs in `attempts`. A definitive HTTP 4xx rejection becomes `failed`; transport failures, HTTP 5xx responses, and malformed acknowledgements remain `submitting` with their `client_id`, because ComfyUI may have accepted them. Execution errors remain in the manifest and become retryable on a later supervisor run only while both counters remain below the cap.
 
 Do not download outputs via `/view`. Require returned output subfolders to be under `books/<book_slug>/video/shots/`, record the returned filename and its absolute Drive path in `video_manifest.json`, and treat a history result outside that prefix as a failed job. Queueing the complete book does not increase generation concurrency: ComfyUI remains responsible for executing its queue at the endpoint's configured concurrency, which defaults to one until capacity is measured.
+
+## LTX prompt preparation
+
+After TTS duration adjustment and before submission, `video_prompt.py` derives a final prompt from the original visual intent and cumulative measured line WAV durations. It adds a duration-dependent action budget, narration context and a settling interval. This is deterministic rule-based preparation, not a language-model rewrite or exact animation/word synchronization. Word timestamps are not currently used. Silent shots use their planned duration and a one-second settling interval.
+
+Keep the original `inputs.prompt` unchanged. Final prompts, timing context and input hashes are stored as `prompt_refinement` in the video manifest and in `planning/video_prompt_refinements.json`. The submitter uses the persisted final prompt. Compilation preserves the metadata. Submitted or previously attempted jobs retain their prompt; retries use the same input. Existing H3 jobs bypass refinement. Refined metadata is included when bundling for final assembly.
+
+The supplied LTX graph retains joint AV sampling but exports silent video, with existing TTS providing final narration. Both sampling passes share the bound shot seed. Internal prompt enhancement stays disabled. The negative prompt excludes illustration-hostile terms. The graph uses integer seconds at 24 fps and `seconds * fps + 1` frames; live model/node compatibility, feasible duration and speed must be checked on the user-supplied endpoint before production. Do not infer readiness from the local template alone.

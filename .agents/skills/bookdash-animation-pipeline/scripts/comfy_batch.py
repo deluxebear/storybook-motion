@@ -170,13 +170,19 @@ def build_workflow(context, job):
     workflow = copy.deepcopy(workflow)
     inputs = job["inputs"]
     values = {
-        "prompt": inputs["prompt"],
-        "negative_prompt": inputs.get("negative_prompt", ""),
+        "prompt": job.get("prompt_refinement", {}).get("prompt", inputs["prompt"]),
         "seed": inputs.get("seed", 0),
         "output_prefix": f"{context.drive_prefix}/{job['shot_id']}",
     }
+    if "negative_prompt" in inputs:
+        values["negative_prompt"] = inputs["negative_prompt"]
     if "duration_seconds" in inputs:
         values["duration_seconds"] = inputs["duration_seconds"]
+        if any(n["class_type"] == "LTXVConditioning" for n in workflow.values()):
+            duration = float(values["duration_seconds"])
+            if not duration.is_integer() or duration <= 0:
+                raise ValueError("LTX duration must be positive whole seconds at 24 fps")
+            values["duration_seconds"] = int(duration)
     if inputs.get("reference_image"):
         source = (context.book / inputs["reference_image"]).resolve()
         if not source.is_relative_to(context.book.resolve()):

@@ -1,0 +1,26 @@
+{
+  "prompt": {
+    "node": "398:376",
+    "input": "value"
+  },
+  "negative_prompt": {
+    "node": "398:373",
+    "input": "text"
+  },
+  "reference_image": {
+    "node": "395",
+    "input": "image"
+  },
+  "seed": {
+    "node": "seed",
+    "input": "value"
+  },
+  "duration_seconds": {
+    "node": "398:362",
+    "input": "value"
+  },
+  "output_prefix": {
+    "node": "75",
+    "input": "filename_prefix"
+  }
+}

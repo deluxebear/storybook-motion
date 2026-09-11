@@ -31,7 +31,7 @@ The model prepares this one versioned contract. Array order matters: `shots` is 
         "reference_image": "source/pages/page-01.jpg",
         "prompt": "Preserve the illustration; gentle ripples move beneath the little boat.",
         "negative_prompt": "flicker, changed character design",
-        "duration_seconds": 6,
+        "duration_seconds": 5,
         "seed": 20260909
       },
       "lines": [
@@ -80,3 +80,5 @@ Video jobs persist `client_id` before submission and `prompt_id` after acknowled
 `l4_handoff` is `authorizing`, `ready`, or `consumed` (cleared after cleanup). `ready` means the foreground command verified Drive and reserved this exact L4 for the child; recovery must not stop it before adoption. Browser authorization runs in the persistent foreground PTY with a 30-minute bound. Its prompts remain in that terminal rather than being redirected to project logs. `--interactive` remains accepted for compatibility; a live PTY is required whenever new authorization is needed.
 
 `logs/pipeline/` holds noninteractive local CLI logs and Drive-side model/assembly logs. `.pipeline/supervisor.log` captures detached errors. `needs_input` is a saved return state, not an agent waiting loop. New invocations supply missing runtime options explicitly. Endpoint URLs and session names are never inferred from another book.
+
+For new LTX projects, the post-TTS prompt stage stores derived `prompt_refinement` metadata separately from the frozen creative inputs; see [comfyui.md](comfyui.md#ltx-prompt-preparation). New projects use the LTX template, while frozen H3 projects remain valid.

@@ -6,7 +6,7 @@ Canonicalize the Book Dash URL and initialize the book with `projectctl.py init`
 
 Read `schemas.md`. Use the actual story and illustrations to prepare `planning/production_plan.json`: fictional voice specifications, ordered shots, ordered spoken lines, reference images, prompts, and explicit seeds. Keep role, scene, shot, and audio IDs stable. Resolve creative choices before execution. The model owns this preparation and later creative review.
 
-`projectctl.py init` installs the canonical `templates/minimax_h3_i2v/` workflow and bindings. Keep book-specific decisions in the production plan. `pipeline.py validate` checks the project's workflow schema and bindings against the canonical template; a different node class, input, connection, or binding is a validation failure requiring an explicit template revision.
+`projectctl.py init` installs the canonical `templates/ltx2_5_i2v/` workflow and bindings. Keep book-specific decisions in the production plan. `pipeline.py validate` checks the project's workflow schema and bindings against the LTX or legacy H3 template; a different node class, input, connection, or binding is a validation failure requiring an explicit template revision.
 
 Read `comfyui.md` when preparing the API workflow and semantic bindings. The user configures the existing ComfyUI output root as `/content/drive/MyDrive/vidio`. A final-video request additionally needs a user-supplied Colab CLI session handle for the same mounted Drive. This handle grants no runtime lifecycle operations.
 

@@ -34,18 +34,15 @@ def workflow_schema(workflow):
 
 
 def validate_workflow_template(workflow_path, bindings_path):
-    expected_workflow = read(TEMPLATE_DIR / "workflow_api.json")
     actual_workflow = read(workflow_path)
-    expected = workflow_schema(expected_workflow)
-    actual = workflow_schema(actual_workflow)
-    if actual != expected:
-        expected_hash = digest(expected)[:12]
-        actual_hash = digest(actual)[:12]
-        raise ValueError(f"workflow schema differs from minimax_h3_i2v template: expected {expected_hash}, got {actual_hash}")
-    expected_bindings = read(TEMPLATE_DIR / "bindings.json")
     actual_bindings = read(bindings_path)
-    if actual_bindings != expected_bindings:
-        raise ValueError("workflow bindings differ from minimax_h3_i2v template")
+    for name in ("minimax_h3_i2v", "ltx2_5_i2v"):
+        template = TEMPLATE_DIR.parent / name
+        if workflow_schema(actual_workflow) == workflow_schema(read(template / "workflow_api.json")):
+            if actual_bindings != read(template / "bindings.json"):
+                raise ValueError(f"workflow bindings differ from {name} template")
+            return name
+    raise ValueError("workflow schema differs from supported templates: minimax_h3_i2v, ltx2_5_i2v")
 
 
 def apply_tts_video_durations(root, padding=TTS_VIDEO_PADDING_SECONDS, minimum=MIN_VIDEO_SECONDS):

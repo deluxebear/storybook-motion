@@ -138,6 +138,8 @@ assert shutil.disk_usage(root).free > 100000000, 'Drive has insufficient free sp
     def bundle(self, session, plan, plan_hash):
         files = {"planning/production_plan.json", "planning/compiled_plan.json", "planning/voice_specs.json",
                  "planning/tts_manifest.json", "planning/video_manifest.json", plan["workflow"], plan["bindings"]}
+        if (self.book / "planning/video_prompt_refinements.json").exists():
+            files.add("planning/video_prompt_refinements.json")
         files.update(s["video"]["reference_image"] for s in plan["shots"])
         files.update(s["selected_voice"] for s in plan["roles"].values() if s.get("selected_voice"))
         archive = self.folder / "inputs.tar.gz"
@@ -300,6 +302,8 @@ Path({remote_archive!r}).unlink()
                 return
             from production_plan import apply_tts_video_durations
             apply_tts_video_durations(self.book)
+            from video_prompt import refine_video_prompts
+            self.stage("video_prompt", lambda: refine_video_prompts(self.book))
             if not self.args.comfy_url:
                 raise NeedsInput("TTS complete. Supply --comfy-url for the user-run ComfyUI endpoint and resume.")
             from comfy_batch import request_json

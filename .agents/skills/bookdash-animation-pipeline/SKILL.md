@@ -1,6 +1,6 @@
 ---
 name: bookdash-animation-pipeline
-description: Turn a Book Dash book URL and a user-run ComfyUI MiniMax H3 URL into a per-book animation project using Colab CLI L4, Google Drive, Qwen3-TTS VoiceDesign, and IndexTTS 2.5. Use for full runs, resumptions, or diagnosis of this Book Dash-to-animation pipeline.
+description: Turn a Book Dash book URL and a user-run ComfyUI URL into a per-book animation project using Colab CLI L4, Google Drive, Qwen3-TTS VoiceDesign, and IndexTTS 2.5. Use for full runs, resumptions, or diagnosis of this Book Dash-to-animation pipeline.
 ---
 
 # Book Dash Animation Pipeline
@@ -9,7 +9,7 @@ Produce one independently resumable project per book. Require a Book Dash book U
 
 Separate creative preparation from execution. The model prepares `planning/production_plan.json` with voice specifications, ordered shots and spoken lines, reference images, and video prompts. Once validated, run `scripts/pipeline.py start` in a persistent PTY. Complete the browser-assisted Drive authorization below; after verification, `start` hands the same L4 to a detached supervisor and returns control. Generation continues without model turns.
 
-Use `templates/minimax_h3_i2v/` as the canonical single-reference video workflow for every book. Book analysis changes only production-plan content and bound runtime values. Validation compares each project's node classes, input names, edge topology, and bindings with that template before compilation.
+Use `templates/ltx2_5_i2v/` as the default single-reference video workflow for new books (5-second template default). Book analysis changes only production-plan content and bound runtime values. Validation accepts this template and the legacy H3 template; preserve frozen existing projects.
 
 ## Read before acting
 
@@ -33,6 +33,8 @@ Use `templates/minimax_h3_i2v/` as the canonical single-reference video workflow
 - Submit only API-format ComfyUI workflows. All books share the single user-supplied ComfyUI endpoint, so serialize batch ownership with `comfy_batch.py`'s endpoint lock. Bind job values by explicit node/input mappings, cap concurrency, persist prompt IDs, poll history, and retry bounded transient failures.
 - The pipeline supervisor owns polling, logging, state persistence, timeouts, and cleanup. Agent-side periodic wait/poll/log-tail loops are prohibited. Follow the launch and recovery contract in the runbook.
 - Configure the user-run ComfyUI output root as `MyDrive/vidio`. Video jobs must write directly to `books/<book_slug>/video/shots/` beneath that root; do not download generated videos to the local agent workspace. Reconcile the manifest from ComfyUI history and its Drive output references.
+
+After TTS, the supervisor prepares duration-aware LTX prompts using deterministic rules and measured line timings. See [references/comfyui.md](references/comfyui.md) for prompt persistence and limitations.
 
 ## Execution aids
 
