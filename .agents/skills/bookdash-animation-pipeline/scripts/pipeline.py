@@ -211,7 +211,10 @@ Path({remote_archive!r}).unlink()
         session = self.state.get("l4_session")
         if not session:
             return
-        self.colab("stop", "-s", session, name="stop-l4", timeout=120)
+        try:
+            self.colab("stop", "-s", session, name="stop-l4", timeout=120)
+        except Exception:
+            pass
         self.colab("sessions", name="verify-stop", timeout=120)
         # Match the exact name in the CLI's server-synchronized session listing.
         import re
@@ -312,7 +315,9 @@ Path({remote_archive!r}).unlink()
             atomic_json(self.book / "comfyui/endpoint.json", {"base_url": base, "checked_at": time.time()})
             self.save(comfy_url=base)
             video_command = [sys.executable, str(HERE / "comfy_batch.py"), "--book-dir", str(self.book),
-                             "--base-url", base, "--timeout", str(self.args.shot_timeout)]
+                             "--base-url", base, "--timeout", str(self.args.shot_timeout),
+                             "--reference-mode", self.args.reference_mode,
+                             "--drive-input-prefix", self.args.drive_input_prefix]
             if self.args.comfy_restarted:
                 video_command.append("--comfy-restarted")
             self.stage("video", lambda: self.command(video_command, "video", timeout=self.args.timeout))
@@ -348,6 +353,10 @@ def main():
     ap.add_argument("--shot-timeout", type=int, default=3600)
     ap.add_argument("--comfy-restarted", action="store_true",
                     help="confirm ComfyUI restarted so missing old prompt IDs may be retried")
+    ap.add_argument("--reference-mode", choices=("upload", "drive"), default="upload",
+                    help="use uploaded images, or references directly from the ComfyUI Drive input mapping")
+    ap.add_argument("--drive-input-prefix", default="vidio",
+                    help="relative ComfyUI input/ path mapped to the shared Drive root")
     ap.add_argument("--interactive", action="store_true", help="allow foreground Drive OAuth consent")
     ap.add_argument("--lock-fd", type=int, help=argparse.SUPPRESS)
     args = ap.parse_args()

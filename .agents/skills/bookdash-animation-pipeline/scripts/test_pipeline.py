@@ -43,7 +43,8 @@ def fixture(parent):
 def arguments(**updates):
     return argparse.Namespace(**{"timeout": 30, "shot_timeout": 2, "assemble": False, "assembly_session": None,
                                  "comfy_url": "http://fake", "until": "video", "interactive": False,
-                                 "comfy_restarted": False, **updates})
+                                 "comfy_restarted": False, "reference_mode": "upload",
+                                 "drive_input_prefix": "vidio", **updates})
 
 
 class FakePipeline(Pipeline):
@@ -367,6 +368,28 @@ class PlanTests(unittest.TestCase):
         self.assertLess(max(posts), first_queue)
         self.assertTrue(all(job["status"] == "succeeded" for job in read(
             self.book / "planning/video_manifest.json")["jobs"]))
+
+    def test_drive_reference_mode_binds_shared_drive_without_upload(self):
+        compile_plan(self.book)
+        job = read(self.book / "planning/video_manifest.json")["jobs"][0]
+        context = comfy_batch.BatchContext(
+            base="http://fake", book=self.book, drive_prefix="books/example/video/shots",
+            drive_root=Path("/content/drive/MyDrive/vidio"),
+            manifest_path=self.book / "planning/video_manifest.json", reference_mode="drive",
+        )
+        with patch.object(comfy_batch, "upload") as upload:
+            workflow = comfy_batch.build_workflow(context, job)
+        upload.assert_not_called()
+        self.assertEqual(workflow["114"]["inputs"]["image"],
+                         "vidio/books/example/source/pages/1.png")
+
+    def test_upload_reference_mode_remains_available(self):
+        compile_plan(self.book)
+        job = read(self.book / "planning/video_manifest.json")["jobs"][0]
+        with patch.object(comfy_batch, "upload", return_value="uploaded.png") as upload:
+            workflow = comfy_batch.build_workflow(self.batch_context(), job)
+        upload.assert_called_once_with("http://fake", self.book / "source/pages/1.png")
+        self.assertEqual(workflow["114"]["inputs"]["image"], "uploaded.png")
 
     def test_submission_error_does_not_block_later_jobs(self):
         self.add_second_shot()

@@ -27,6 +27,8 @@ class BatchContext:
     drive_root: Path
     manifest_path: Path
     restart_confirmed: bool = False
+    reference_mode: str = "upload"
+    drive_input_prefix: str = "vidio"
 
     def save(self, jobs):
         save_manifest(self.manifest_path, jobs)
@@ -176,7 +178,19 @@ def build_workflow(context, job):
     if "duration_seconds" in inputs:
         values["duration_seconds"] = inputs["duration_seconds"]
     if inputs.get("reference_image"):
-        values["reference_image"] = upload(context.base, context.book / inputs["reference_image"])
+        source = (context.book / inputs["reference_image"]).resolve()
+        if not source.is_relative_to(context.book.resolve()):
+            raise ValueError(f"reference image escapes book: {inputs['reference_image']}")
+        if context.reference_mode == "drive":
+            # ComfyUI's input/vidio symlink points at the shared Drive root.
+            # LoadImage deliberately receives a path relative to input/, never
+            # an arbitrary absolute filesystem path.
+            relative = source.relative_to(context.book.resolve()).as_posix()
+            values["reference_image"] = (
+                f"{context.drive_input_prefix}/books/{context.book.name}/{relative}"
+            )
+        else:
+            values["reference_image"] = upload(context.base, source)
     for key, value in values.items():
         if key in bindings:
             set_binding(workflow, bindings[key], value)
@@ -354,7 +368,9 @@ def run_batch(args):
                     or f"books/{book.name}/video/shots").strip("/")
     manifest_path = book / "planning/video_manifest.json"
     context = BatchContext(base, book, drive_prefix, Path(args.drive_root), manifest_path,
-                           getattr(args, "comfy_restarted", False))
+                           getattr(args, "comfy_restarted", False),
+                           getattr(args, "reference_mode", "upload"),
+                           getattr(args, "drive_input_prefix", "vidio").strip("/"))
     data = json.loads(manifest_path.read_text())
     jobs = data["jobs"] if isinstance(data, dict) else data
     selected = selected_jobs(jobs, getattr(args, "shot_id", None))
@@ -382,6 +398,10 @@ def main():
                         help="Drive directory configured as ComfyUI output root")
     parser.add_argument("--drive-output-prefix",
                         help="output subdirectory below --drive-root; defaults to books/<book>/video/shots")
+    parser.add_argument("--reference-mode", choices=("upload", "drive"), default="upload",
+                        help="upload reference images, or read them through ComfyUI input/vidio mapped to Drive")
+    parser.add_argument("--drive-input-prefix", default="vidio",
+                        help="relative ComfyUI input/ path that maps to --drive-root in --reference-mode drive")
     parser.add_argument("--shot-id", help="run only one shot; used for Drive-output preflight")
     run_batch(parser.parse_args())
 
