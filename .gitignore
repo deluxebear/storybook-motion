@@ -3,3 +3,4 @@
 /notebooks/*_output.ipynb
 /.pipeline/**/status.json
 __pycache__/
+/url
