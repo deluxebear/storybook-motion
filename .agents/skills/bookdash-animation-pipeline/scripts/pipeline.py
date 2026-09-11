@@ -291,7 +291,7 @@ Path({remote_archive!r}).unlink()
                     self.stage("voice_design", lambda: self.remote_stage(session, "voice", ["python", script, "voice", "--book-dir", str(self.remote_book)]))
                     def synthesize():
                         self.remote_stage(session, "tts", ["python", script, "tts", "--book-dir", str(self.remote_book)])
-                        self.sync(session, ["planning/tts_manifest.json", "planning/video_manifest.json", "qa/tts_validation.json", "qa/voice_selection.json"])
+                        self.sync(session, ["planning/tts_manifest.json", "planning/video_manifest.json", "qa/tts_validation.json", "qa/voice_selection.json", "qa/subtitle_alignment.json"])
                     self.stage("tts", synthesize)
                 finally:
                     self.stop_l4()

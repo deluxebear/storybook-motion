@@ -7,6 +7,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from subtitles import export_subtitles
+
 
 def duration(path: Path) -> float:
     result = subprocess.run(
@@ -59,6 +61,10 @@ def main() -> None:
         prior = json.loads(existing_report.read_text())
         if prior.get("render_hash") == render_hash and prior.get("output") == str(output.relative_to(book)):
             run(["ffmpeg", "-v", "error", "-xerror", "-i", str(output), "-f", "null", "-"])
+            prior['subtitles'] = export_subtitles(
+                book, output, prior['segments'], tts, lambda row: duration(book / row['output']))
+            from projectctl import atomic_json
+            atomic_json(existing_report, prior)
             print(output)
             return
     segments_dir = final_dir / "segments"
@@ -131,9 +137,10 @@ def main() -> None:
     finally:
         listing_path.unlink(missing_ok=True)
     run(["ffmpeg", "-v", "error", "-xerror", "-i", str(output), "-f", "null", "-"])
+    subtitles = export_subtitles(book, output, report, tts, lambda row: duration(book / row['output']))
     from projectctl import atomic_json
     atomic_json(final_dir / "assembly_manifest.json", {
-        "output": str(output.relative_to(book)), "seconds": duration(output), "segments": report, "render_hash": render_hash,
+        "output": str(output.relative_to(book)), "seconds": duration(output), "segments": report, "render_hash": render_hash, "subtitles": subtitles,
     })
     print(output)
 

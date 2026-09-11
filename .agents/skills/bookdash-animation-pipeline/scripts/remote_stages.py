@@ -92,6 +92,8 @@ def tts(book, model_dir):
         output = relative(book, job["output"])
         qa = valid_audio(output)
         if job.get("status") == "succeeded" and qa:
+            job.update(**qa)
+            atomic_json(manifest, {"jobs": jobs})
             continue
         temporary = output.with_suffix(".tmp.wav")
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -152,6 +154,8 @@ def main():
         repo = setup_tts(model_dir)
         env = {**os.environ, "PYTHONPATH": str(repo)}
         subprocess.run(["uv", "run", "python", str(Path(__file__).resolve()), "tts-worker", "--book-dir", str(book)], cwd=repo, env=env, check=True)
+        from alignment import run_optional
+        run_optional(book)
     elif a.stage == "tts-worker":
         tts(book, model_dir)
     else:
