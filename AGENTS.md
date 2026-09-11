@@ -1,36 +1,45 @@
 # AGENTS.md - Vidio Project Agent Guidelines
 
-> **AI Agent 必读**：本项目是一个高度精细化设计的多模态自动化流水线项目（绘本 -> 动画视频与语音）。在执行任何修改或运行前，请先阅读本文件及 `PROJECT_MEMORY.md`。
+> **AI Agent 必读**：本文件是当前仓库的执行规范。先确认目标书籍、运行环境和现有状态，再修改或启动任务。
 
 ---
 
 ## 1. 核心上下文与指引
-- **权威项目记忆手册**：参见 [PROJECT_MEMORY.md](PROJECT_MEMORY.md)
-- **绘本动画核心技能**：参见 [.agents/skills/bookdash-animation-pipeline/SKILL.md](.agents/skills/bookdash-animation-pipeline/SKILL.md)
-- **ComfyUI 会话管理技能**：参见 [.agents/skills/colab-comfyui-session/SKILL.md](.agents/skills/colab-comfyui-session/SKILL.md)
-- **Token 优化与远程交互范式**：参见 [docs/ai-agent-token-optimization-colab-case.md](docs/ai-agent-token-optimization-colab-case.md)
+- **项目说明**：先读 [README.md](README.md)；需要远程交互时读 [token 优化文档](docs/ai-agent-token-optimization-colab-case.md)。
+- **绘本动画流水线**：涉及绘本、TTS、渲染或合成时，读取 [.agents/skills/bookdash-animation-pipeline/SKILL.md](.agents/skills/bookdash-animation-pipeline/SKILL.md)。
+- **ComfyUI 会话**：涉及启动、恢复或检查 ComfyUI 时，读取 [.agents/skills/colab-comfyui-session/SKILL.md](.agents/skills/colab-comfyui-session/SKILL.md)。
+- `PROJECT_MEMORY.md` 当前不存在；若后续补充，应作为项目记忆参考，不覆盖本文件。
 
 ---
 
 ## 2. 行为铁律 (Strict Invariants)
 
-1. **绝对禁止在循环中进行 Sleep 或轮询 (No Polling Loops)**：
+1. **异步任务交给 Supervisor**：
    - 长时间运行任务（TTS、ComfyUI 渲染、合成）交由独立的守护进程（Supervisor）托管。
    - Agent 触发启动后立即汇报 `launched_pid`、日志路径并交还控制权。
    - 只有在用户主动询问或下一步触发时，单次执行 `pipeline.py status` 查看状态。
 
-2. **输出分层与 Token 节约 (Token Optimization)**：
+2. **输出保持结构化且短**：
    - 远程 Colab 命令禁止直接回传全量 pip/进度条/冗长日志。
    - “正常静默、异常取样”：成功仅输出结构化探针确认结果；失败仅保留末尾 20 行核心错误。
 
-3. **GPU 实例与费用安全 (GPU Lifecycle)**：
+3. **GPU 生命周期安全**：
    - TTS 所需的 L4 实例独立归属各单本书，完成或失败后必须确保 `colab stop`。
    - ComfyUI 运行在用户指定的 A100 High-Mem 实例上，绝不擅自降级、多重创建或擅自终止用户运行中的 ComfyUI 实例。
 
-4. **数据存储与持久化规范**：
+4. **数据与幂等性**：
    - 所有模型和生成媒体资产直接写往挂载的 Google Drive：`/content/drive/MyDrive/vidio/`。
    - 本地工作区禁止下载大型 MP4 视频或大型模型权重文件，只同步 JSON 元数据和轻量 QA 报告。
    - 生产计划通过 `plan_hash` 冻结。已提交或成功的镜头任务保持幂等，不得无故覆写。
+
+5. **先检查后操作**：
+   - 修改前查看相关文件和 `git diff`，保留用户已有改动。
+   - 运行前确认目标目录、ComfyUI URL、Drive 挂载和当前状态；缺少必要条件时只报告阻断原因。
+   - 不下载大型 MP4、模型权重或全量远程日志到本地。
+
+6. **完成标准**：
+   - 修改后只运行与改动相关的最小验证；报告命令、结果和未解决问题。
+   - 不提交、推送、停止用户实例或删除数据，除非用户明确要求。
 
 ---
 
@@ -43,7 +52,7 @@ python .agents/skills/bookdash-animation-pipeline/scripts/pipeline.py validate -
 # 编译生成运行时清单
 python .agents/skills/bookdash-animation-pipeline/scripts/pipeline.py compile --book-dir books/<book_slug>
 
-# 启动执行流水线（需在 PTY 中挂载 Drive）
+# 启动执行流水线（需在 PTY 中挂载 Drive；启动后立即返回 PID 和日志）
 python .agents/skills/bookdash-animation-pipeline/scripts/pipeline.py start --book-dir books/<book_slug> --comfy-url $(cat url)
 
 # 单次查询流水线状态
