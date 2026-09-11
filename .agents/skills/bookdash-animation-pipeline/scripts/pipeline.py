@@ -311,7 +311,11 @@ Path({remote_archive!r}).unlink()
                 raise NeedsInput(f"ComfyUI endpoint needs attention: {exc}") from exc
             atomic_json(self.book / "comfyui/endpoint.json", {"base_url": base, "checked_at": time.time()})
             self.save(comfy_url=base)
-            self.stage("video", lambda: self.command([sys.executable, str(HERE / "comfy_batch.py"), "--book-dir", str(self.book), "--base-url", base, "--timeout", str(self.args.shot_timeout)], "video", timeout=self.args.timeout))
+            video_command = [sys.executable, str(HERE / "comfy_batch.py"), "--book-dir", str(self.book),
+                             "--base-url", base, "--timeout", str(self.args.shot_timeout)]
+            if self.args.comfy_restarted:
+                video_command.append("--comfy-restarted")
+            self.stage("video", lambda: self.command(video_command, "video", timeout=self.args.timeout))
             if self.args.assemble:
                 if not self.args.assembly_session:
                     raise NeedsInput("Videos complete. Supply --assembly-session for the existing A100 with this Drive mounted.")
@@ -342,6 +346,8 @@ def main():
     ap.add_argument("--until", choices=["tts", "video"], default="video")
     ap.add_argument("--timeout", type=int, default=14400, help="maximum seconds per stage")
     ap.add_argument("--shot-timeout", type=int, default=3600)
+    ap.add_argument("--comfy-restarted", action="store_true",
+                    help="confirm ComfyUI restarted so missing old prompt IDs may be retried")
     ap.add_argument("--interactive", action="store_true", help="allow foreground Drive OAuth consent")
     ap.add_argument("--lock-fd", type=int, help=argparse.SUPPRESS)
     args = ap.parse_args()

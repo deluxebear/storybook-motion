@@ -69,13 +69,13 @@ The compiler derives these; the model does not maintain them separately:
 
 TTS outputs are `voices/selected/<role_id>.wav` and `audio/lines/<audio_id>.wav`; candidates/QA stay under `voices/candidates/` and `qa/`. The assembler concatenates lines into `audio/mixes/<shot_id>.wav` in plan order.
 
-Video jobs persist `client_id` before submission and `prompt_id` after acknowledgement. Status is `pending`, `submitting`, `running`, `succeeded`, or `failed`. Actual output fields are `remote_output`, `remote_filename`, and `remote_subfolder`; returned filenames take precedence over planned names and stay beneath the book's Drive `video/shots/`. No local video copy is required.
+Video jobs persist `client_id` before submission and `prompt_id` after acknowledgement. Status is `pending`, `submitting`, `queued`, `running`, `succeeded`, or `failed`. The submitter records the normalized `endpoint`, `post_attempts`, and `submitted_at`; `attempts` counts acknowledged prompt IDs, while `post_attempts` counts every POST and caps submissions at three. When an endpoint change confirms that a recorded prompt was lost, its identifiers move to `previous_prompt_ids` and `previous_client_ids` before a bounded retry. Actual output fields are `remote_output`, `remote_filename`, and `remote_subfolder`; returned filenames take precedence over planned names and stay beneath the book's Drive `video/shots/`. No local video copy is required.
 
 `video/final/assembly_manifest.json` records the final output and ordered segments, audio IDs, and measured durations. Assembly normalizes to 1280×720/24fps with padded framing and extends the final frame when narration is longer.
 
 ## Supervisor state
 
-`.pipeline/state.json` is local, atomically written, and protected by a per-book process lock. It records the input hash, PID, stages, timestamps, errors, Drive path, exact owned L4 session, and cleanup outcome. `status.json` mirrors the summary. `--timeout` bounds a stage; `--shot-timeout` bounds a ComfyUI history/lock wait. A hard crash can leave state as `running`; recovery retries recorded cleanup before advancing.
+`.pipeline/state.json` is local, atomically written, and protected by a per-book process lock. It records the input hash, PID, stages, timestamps, errors, Drive path, exact owned L4 session, and cleanup outcome. `status.json` mirrors the summary. `--timeout` bounds a stage; `--shot-timeout` bounds endpoint-outage tolerance per batch and contributes one tracking-timeout allowance per active prompt. A hard crash can leave state as `queued` or `running`; recovery reconciles recorded prompt and client IDs before advancing.
 
 `l4_handoff` is `authorizing`, `ready`, or `consumed` (cleared after cleanup). `ready` means the foreground command verified Drive and reserved this exact L4 for the child; recovery must not stop it before adoption. Browser authorization runs in the persistent foreground PTY with a 30-minute bound. Its prompts remain in that terminal rather than being redirected to project logs. `--interactive` remains accepted for compatibility; a live PTY is required whenever new authorization is needed.
 

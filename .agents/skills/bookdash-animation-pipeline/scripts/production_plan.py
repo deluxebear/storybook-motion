@@ -74,7 +74,7 @@ def apply_tts_video_durations(root, padding=TTS_VIDEO_PADDING_SECONDS, minimum=M
             continue
         # Prompt IDs and outputs describe immutable submissions. Only future or
         # explicitly failed attempts may receive the corrected runtime input.
-        if job.get("status", "pending") in {"submitting", "running", "succeeded"}:
+        if job.get("status", "pending") in {"submitting", "queued", "running", "succeeded"}:
             skipped.append(job["shot_id"])
             continue
         job["inputs"]["duration_seconds"] = target

@@ -1,12 +1,14 @@
 """Offline contract and failure-path tests; never allocate a GPU or contact ComfyUI."""
 import argparse
 import copy
+import io
 import json
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -40,7 +42,8 @@ def fixture(parent):
 
 def arguments(**updates):
     return argparse.Namespace(**{"timeout": 30, "shot_timeout": 2, "assemble": False, "assembly_session": None,
-                                 "comfy_url": "http://fake", "until": "video", "interactive": False, **updates})
+                                 "comfy_url": "http://fake", "until": "video", "interactive": False,
+                                 "comfy_restarted": False, **updates})
 
 
 class FakePipeline(Pipeline):
@@ -102,6 +105,25 @@ class PlanTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.book, self.plan = fixture(self.temp.name)
 
+    def add_second_shot(self):
+        second = copy.deepcopy(self.plan["shots"][0])
+        second.update(scene_id="S002", shot_id="S002_SH001")
+        for index, line in enumerate(second["lines"], 1):
+            line["audio_id"] = f"S002_SH001_A00{index}"
+        self.plan["shots"].append(second)
+        atomic_json(self.book / "planning/production_plan.json", self.plan)
+        compile_plan(self.book)
+
+    def batch_context(self, base="http://fake", restart_confirmed=False):
+        return comfy_batch.BatchContext(
+            base=base,
+            book=self.book,
+            drive_prefix="books/example/video/shots",
+            drive_root=Path("/content/drive/MyDrive/vidio"),
+            manifest_path=self.book / "planning/video_manifest.json",
+            restart_confirmed=restart_confirmed,
+        )
+
     def test_compile_keeps_line_order_and_runtime_ids(self):
         compile_plan(self.book)
         path = self.book / "planning/video_manifest.json"
@@ -134,6 +156,21 @@ class PlanTests(unittest.TestCase):
         video_path = self.book / "planning/video_manifest.json"
         data = read(video_path)
         data["jobs"][0].update(status="running", prompt_id="already-submitted")
+        atomic_json(video_path, data)
+        result = apply_tts_video_durations(self.book)
+        self.assertEqual(read(video_path)["jobs"][0]["inputs"]["duration_seconds"], 2)
+        self.assertEqual(result["skipped_submitted"], ["S001_SH001"])
+
+    def test_video_duration_does_not_rewrite_queued_job(self):
+        compile_plan(self.book)
+        tts_path = self.book / "planning/tts_manifest.json"
+        data = read(tts_path)
+        for row in data["jobs"]:
+            row.update(status="succeeded", seconds=10)
+        atomic_json(tts_path, data)
+        video_path = self.book / "planning/video_manifest.json"
+        data = read(video_path)
+        data["jobs"][0].update(status="queued", prompt_id="already-submitted")
         atomic_json(video_path, data)
         result = apply_tts_video_durations(self.book)
         self.assertEqual(read(video_path)["jobs"][0]["inputs"]["duration_seconds"], 2)
@@ -287,10 +324,192 @@ class PlanTests(unittest.TestCase):
         compile_plan(self.book)
         path = self.book / "planning/video_manifest.json"
         data = read(path); data["jobs"][0].update(status="submitting", client_id="unknown"); atomic_json(path, data)
-        args = argparse.Namespace(base_url="http://fake", book_dir=str(self.book), drive_output_prefix=None, shot_id=None)
+        args = argparse.Namespace(base_url="http://fake", book_dir=str(self.book), drive_output_prefix=None,
+                                  drive_root="/content/drive/MyDrive/vidio", lock_file=None, shot_id=None,
+                                  timeout=0, poll=.01, missing_grace=0)
         with patch.object(comfy_batch, "request_json", return_value={}):
-            with self.assertRaisesRegex(RuntimeError, "ambiguous submission"):
+            with self.assertRaises(SystemExit):
                 comfy_batch.run_batch(args)
+        current = read(path)["jobs"][0]
+        self.assertEqual(current["status"], "submitting")
+        self.assertIn("ambiguous submission requires reconciliation", current["error"])
+
+    def test_submits_whole_batch_before_monitoring(self):
+        self.add_second_shot()
+        calls = []
+        prompt_ids = iter(("pid-1", "pid-2"))
+
+        def request(url, method="GET", obj=None):
+            calls.append((url, method))
+            if url.endswith("/prompt"):
+                return {"prompt_id": next(prompt_ids)}
+            if url.endswith("/queue") or url.endswith("/system_stats"):
+                return {}
+            prompt_id = url.rsplit("/", 1)[-1]
+            shot_id = "S001_SH001" if prompt_id == "pid-1" else "S002_SH001"
+            return {prompt_id: {"status": {"status_str": "success"}, "outputs": {"1": {"videos": [{
+                "filename": f"{shot_id}_00001.mp4",
+                "subfolder": f"books/example/video/shots/{shot_id}",
+                "type": "output",
+            }]}}}}
+
+        args = argparse.Namespace(base_url="http://fake", book_dir=str(self.book), drive_output_prefix=None,
+                                  drive_root="/content/drive/MyDrive/vidio", lock_file=str(self.book / "endpoint.lock"),
+                                  shot_id=None, timeout=2, poll=.01, missing_grace=.01)
+        with patch.object(comfy_batch, "request_json", side_effect=request), \
+                patch.object(comfy_batch, "upload", return_value="uploaded.png"):
+            with self.assertRaises(SystemExit) as stopped:
+                comfy_batch.run_batch(args)
+        self.assertFalse(stopped.exception.code)
+        posts = [index for index, call in enumerate(calls) if call[0].endswith("/prompt")]
+        first_queue = next(index for index, call in enumerate(calls) if call[0].endswith("/queue"))
+        self.assertEqual(len(posts), 2)
+        self.assertLess(max(posts), first_queue)
+        self.assertTrue(all(job["status"] == "succeeded" for job in read(
+            self.book / "planning/video_manifest.json")["jobs"]))
+
+    def test_submission_error_does_not_block_later_jobs(self):
+        self.add_second_shot()
+        path = self.book / "planning/video_manifest.json"
+        jobs = read(path)["jobs"]
+        posts = 0
+
+        def request(url, method="GET", obj=None):
+            nonlocal posts
+            if not url.endswith("/prompt"):
+                return {}
+            posts += 1
+            if posts == 1:
+                raise urllib.error.URLError("connection reset")
+            return {"prompt_id": "pid-2"}
+
+        with patch.object(comfy_batch, "request_json", side_effect=request), \
+                patch.object(comfy_batch, "upload", return_value="uploaded.png"):
+            comfy_batch.submit_batch(self.batch_context(), jobs, jobs)
+        current = read(path)["jobs"]
+        self.assertEqual(posts, 2)
+        self.assertEqual(current[0]["status"], "submitting")
+        self.assertEqual(current[1]["status"], "queued")
+
+    def test_submitting_job_reconciles_by_client_id(self):
+        compile_plan(self.book)
+        path = self.book / "planning/video_manifest.json"
+        jobs = read(path)["jobs"]
+        jobs[0].update(status="submitting", client_id="client-1")
+        atomic_json(path, {"jobs": jobs})
+        queue = {"queue_pending": [[1, "pid-1", {}, {"client_id": "client-1"}]], "queue_running": []}
+        with patch.object(comfy_batch, "request_json", side_effect=(queue, {})):
+            comfy_batch.reconcile_jobs(self.batch_context(), jobs, jobs)
+        current = read(path)["jobs"][0]
+        self.assertEqual(current["status"], "queued")
+        self.assertEqual(current["prompt_id"], "pid-1")
+
+    def test_reconciliation_error_does_not_block_later_submission(self):
+        self.add_second_shot()
+        path = self.book / "planning/video_manifest.json"
+        jobs = read(path)["jobs"]
+        jobs[0].update(status="submitting", client_id="client-1")
+        atomic_json(path, {"jobs": jobs})
+
+        def request(url, method="GET", obj=None):
+            if url.endswith("/queue"):
+                raise urllib.error.URLError("temporary outage")
+            if url.endswith("/prompt"):
+                return {"prompt_id": "pid-2"}
+            return {}
+
+        with patch.object(comfy_batch, "request_json", side_effect=request), \
+                patch.object(comfy_batch, "upload", return_value="uploaded.png"):
+            comfy_batch.reconcile_jobs(self.batch_context(), jobs, jobs)
+            comfy_batch.submit_batch(self.batch_context(), jobs, jobs)
+        current = read(path)["jobs"]
+        self.assertEqual(current[0]["status"], "submitting")
+        self.assertIn("reconciliation unavailable", current[0]["error"])
+        self.assertEqual(current[1]["status"], "queued")
+
+    def test_tracker_recovers_from_transient_queue_error(self):
+        compile_plan(self.book)
+        path = self.book / "planning/video_manifest.json"
+        jobs = read(path)["jobs"]
+        jobs[0].update(status="queued", prompt_id="pid-1")
+        atomic_json(path, {"jobs": jobs})
+        calls = 0
+
+        def request(url, method="GET", obj=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise urllib.error.URLError("connection reset")
+            if url.endswith("/queue"):
+                return {}
+            return {"pid-1": {"status": {"status_str": "success"}, "outputs": {"1": {"videos": [{
+                "filename": "S001_SH001_00001.mp4",
+                "subfolder": "books/example/video/shots/S001_SH001",
+                "type": "output",
+            }]}}}}
+
+        with patch.object(comfy_batch, "request_json", side_effect=request), \
+                patch.object(comfy_batch.time, "sleep"):
+            comfy_batch.monitor_batch(self.batch_context(), jobs, jobs, 2, .01, .01)
+        self.assertEqual(read(path)["jobs"][0]["status"], "succeeded")
+
+    def test_restart_lost_prompt_is_requeued_on_new_endpoint(self):
+        compile_plan(self.book)
+        path = self.book / "planning/video_manifest.json"
+        jobs = read(path)["jobs"]
+        jobs[0].update(status="queued", prompt_id="old-pid", client_id="old-client",
+                       endpoint="http://old", attempts=1, post_attempts=1)
+        atomic_json(path, {"jobs": jobs})
+        with patch.object(comfy_batch, "request_json", side_effect=({}, {})):
+            comfy_batch.reconcile_jobs(self.batch_context("http://new"), jobs, jobs)
+        current = read(path)["jobs"][0]
+        self.assertEqual(current["status"], "failed")
+        self.assertNotIn("prompt_id", current)
+        self.assertEqual(current["previous_prompt_ids"], ["old-pid"])
+        self.assertFalse(comfy_batch.submission_limit_reached(current))
+
+    def test_confirmed_same_endpoint_restart_recovers_legacy_prompt(self):
+        compile_plan(self.book)
+        path = self.book / "planning/video_manifest.json"
+        jobs = read(path)["jobs"]
+        jobs[0].update(status="running", prompt_id="legacy-pid", client_id="legacy-client", attempts=1)
+        atomic_json(path, {"jobs": jobs})
+        with patch.object(comfy_batch, "request_json", side_effect=({}, {})):
+            comfy_batch.reconcile_jobs(self.batch_context(restart_confirmed=True), jobs, jobs)
+        current = read(path)["jobs"][0]
+        self.assertEqual(current["status"], "failed")
+        self.assertEqual(current["previous_prompt_ids"], ["legacy-pid"])
+        self.assertNotIn("prompt_id", current)
+
+    def test_definitive_prompt_rejection_is_retryable_and_bounded(self):
+        compile_plan(self.book)
+        path = self.book / "planning/video_manifest.json"
+        jobs = read(path)["jobs"]
+        rejected = urllib.error.HTTPError("http://fake/prompt", 400, "bad prompt", {}, io.BytesIO())
+        self.addCleanup(rejected.close)
+        with patch.object(comfy_batch, "request_json", side_effect=rejected), \
+                patch.object(comfy_batch, "upload", return_value="uploaded.png"):
+            comfy_batch.submit_batch(self.batch_context(), jobs, jobs)
+        current = read(path)["jobs"][0]
+        self.assertEqual(current["status"], "failed")
+        self.assertEqual(current["post_attempts"], 1)
+        self.assertFalse(comfy_batch.submission_limit_reached(current))
+        current["post_attempts"] = 3
+        self.assertTrue(comfy_batch.submission_limit_reached(current))
+
+    def test_targeted_reconciliation_preserves_unselected_jobs(self):
+        self.add_second_shot()
+        path = self.book / "planning/video_manifest.json"
+        jobs = read(path)["jobs"]
+        jobs[0].update(status="submitting", client_id="client-1")
+        atomic_json(path, {"jobs": jobs})
+        queue = {"queue_pending": [[1, "pid-1", {}, {"client_id": "client-1"}]], "queue_running": []}
+        with patch.object(comfy_batch, "request_json", side_effect=(queue, {})):
+            comfy_batch.reconcile_jobs(self.batch_context(), jobs, [jobs[0]])
+        current = read(path)["jobs"]
+        self.assertEqual(len(current), 2)
+        self.assertEqual(current[0]["prompt_id"], "pid-1")
+        self.assertEqual(current[1]["status"], "pending")
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg required")
     def test_assembly_contains_both_lines_and_uses_actual_video_path(self):
