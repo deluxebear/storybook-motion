@@ -115,7 +115,8 @@ def main() -> None:
         run([
             "ffmpeg", "-y", "-v", "error", "-i", str(video_path), "-i", str(audio_path),
             "-filter_complex", graph, "-map", "[v]", "-map", "[a]", "-t", f"{target_seconds:.3f}",
-            "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-c:a", "aac", "-b:a", "192k",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-threads", "2",
+            "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart", str(temporary),
         ])
         os.replace(temporary, segment)

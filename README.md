@@ -15,9 +15,11 @@
 - **自动字幕文件**：L4 配音后用原始台词做强制对齐，最终合成时生成 UTF-8 SRT / WebVTT；对齐失败自动回退到 WAV 时长，无需另开 GPU 实例。
 - **云端高效算力调度**：
   - 深度集成 **Google Colab CLI** 与 **Google Drive**。
-  - **L4 GPU 实例** 按需分配用于运行 TTS 和字幕对齐，执行完毕立即自动释放，杜绝闲置计费。
+  - 用户预先运行并挂载 Drive 的两个固定 **L4 GPU 会话**：`voice` 专用于 VoiceDesign，`tts` 专用于 IndexTTS 2.5 与字幕对齐；流水线只验证、投递和恢复，不创建、挂载或停止它们。
   - **A100 GPU 实例** 承载 ComfyUI 服务与最终云端视频拼接合成（`assemble_final.py`），零本地大文件吞吐。
 - **AI Agent 原生设计**：
+  - 大模型只负责理解素材并冻结 `production_plan.json`；冻结后的种子、清单、时长、提示词绑定、重试和合成都由确定性代码执行。
+  - 仓库级 Supervisor 常驻监听 `books/`，按书幂等推进；进程重启、单阶段失败或临时端点中断后可从持久状态恢复。
   - 严格遵循**“输出分层”**与**“正常静默、异常取样”**哲学，最小化上下文 Token 开销。
   - 采用独立进程守护（Supervisor）机制，禁止无意义的轮询与休眠。
 
@@ -42,18 +44,19 @@ python .agents/skills/bookdash-animation-pipeline/scripts/pipeline.py validate -
 # 2. 编译生产清单
 python .agents/skills/bookdash-animation-pipeline/scripts/pipeline.py compile --book-dir books/444797-where-is-your-school
 
-# 3. 启动后台流水线（自动拉取 L4 执行语音设计与合成，并向 ComfyUI 提交视频）
-python .agents/skills/bookdash-animation-pipeline/scripts/pipeline.py start \
-  --book-dir books/444797-where-is-your-school \
-  --comfy-url $(cat url)
+# 3. 启动仓库监听器（只需一次；固定使用现有 voice / tts 会话）
+python .agents/skills/bookdash-animation-pipeline/scripts/pipeline.py watch-start
 
-# 4. 单次查询当前进度
+# 4. 单次查询监听器或某本书的当前进度
+python .agents/skills/bookdash-animation-pipeline/scripts/pipeline.py watch-status
 python .agents/skills/bookdash-animation-pipeline/scripts/pipeline.py status --book-dir books/444797-where-is-your-school
 ```
 
+监听器包含相互独立的 `voice`、`tts`、`video`、`final` 四个单任务槽位。ComfyUI 完成一本书后立即释放 `video` 槽，下一本可以继续提交和生成；上一本文书在独立 `final` 槽中继续合成。Final 仍运行于现有 `ComfyUI` 会话，但仅使用低 CPU/I/O 优先级、受限线程数的 CPU FFmpeg，不占用 GPU。VoiceDesign 完成后，持久化状态会让该书在下一轮扫描直接进入 `tts`，不会再次生成音色。监听器从仓库根目录的 `url` 文件读取 ComfyUI 地址；地址缺失或健康检查失败时，只阻塞 `video` 槽位，已完成的语音结果保持不变，其他槽位继续处理。监听器写入 `.pipeline/notifications.jsonl` 并尽力发送桌面通知，待用户更新 `url` 后自动续跑。单本书也可以用 `pipeline.py start --book-dir ...` 投递，同样复用 `voice` 和 `tts`。
+
 ## 字幕工作流
 
-使用 `pipeline.py start --book-dir books/<book_slug> --comfy-url <URL> --assemble --assembly-session <现有A100会话名>`，Supervisor 在最终合成阶段自动导出字幕。视频、音频和字幕均保存在该书的 Drive 目录中。
+默认情况下，监听器或单本 Supervisor 会在全部镜头成功后把书交给独立 `final` 阶段，在现有 `ComfyUI` 会话中生成带旁白的 MP4 以及 SRT/VTT 字幕边车文件。它不会占用视频调度槽，CPU 编码也使用低优先级和受限线程。会话名称不同时使用 `--assembly-session <现有会话名>`；只有明确只需要分镜视频时才传 `--no-assemble`。视频、音频和字幕均保存在该书的 Drive 目录中。
 
 默认产物：
 
@@ -61,7 +64,7 @@ python .agents/skills/bookdash-animation-pipeline/scripts/pipeline.py status --b
 - `video/final/narrated_final.vtt`：网页播放器字幕。
 - `video/final/narrated_final.subtitles.json`：每条字幕的台词 ID、起止毫秒、文字和文件校验值；`assembly_manifest.json` 同时记录字幕结果。
 
-每条 TTS 台词对应一条字幕。L4 上的 TTS 子进程退出后，自动在独立 Python 环境中运行 Qwen3-ForcedAligner-0.6B（`qwen-asr==0.0.6`），保存词级时间戳到 `qa/subtitle_alignment.json`；随后释放该书的 L4。模型缓存直接写入 Drive 的 `vidio/models/huggingface/`，运行日志保存在该书的 `qa/subtitle_alignment.log`。
+每条 TTS 台词对应一条字幕。`tts` L4 上的 TTS 子进程退出后，自动在独立 Python 环境中运行 Qwen3-ForcedAligner-0.6B（`qwen-asr==0.0.6`），保存词级时间戳到 `qa/subtitle_alignment.json`；任务结束只释放本地会话锁，`tts` Colab 会话继续运行。模型缓存直接写入 Drive 的 `vidio/models/huggingface/`，运行日志保存在该书的 `qa/subtitle_alignment.log`。
 
 A100 合成时读取对齐结果，以首词开始和末词结束作为字幕范围，字幕文字仍使用原始台词。最终字幕 JSON 同时包含换算到成片时间轴的词级时间戳，便于后续实现逐词高亮；SRT / WebVTT 目前仍按台词显示，不自动切分长句。镜头间按合成片段实测时长累计，保留尾部留白和无对白镜头。
 

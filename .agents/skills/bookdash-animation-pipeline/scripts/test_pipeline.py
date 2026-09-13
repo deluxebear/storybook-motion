@@ -1,5 +1,6 @@
 """Offline contract and failure-path tests; never allocate a GPU or contact ComfyUI."""
 import argparse
+import contextlib
 import copy
 import io
 import json
@@ -13,11 +14,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 import comfy_batch
+import pipeline_watcher
 from pipeline import NeedsInput, Pipeline, project_lock
 from production_plan import apply_tts_video_durations, compile_plan, read, validate
 from projectctl import atomic_json
+from video_prompt import refine_video_prompts
 
 TEMPLATE_DIR = Path(__file__).resolve().parents[1] / "templates/minimax_h3_i2v"
+LTX_TEMPLATE_DIR = Path(__file__).resolve().parents[1] / "templates/ltx2_5_i2v"
 TEMPLATE_OBJECT_INFO = {
     node["class_type"]: {}
     for node in json.loads((TEMPLATE_DIR / "workflow_api.json").read_text()).values()
@@ -42,9 +46,10 @@ def fixture(parent):
 
 def arguments(**updates):
     return argparse.Namespace(**{"timeout": 30, "shot_timeout": 2, "assemble": False, "assembly_session": None,
-                                 "comfy_url": "http://fake", "until": "video", "interactive": False,
+                                 "comfy_url": "http://fake", "until": "video",
                                  "comfy_restarted": False, "reference_mode": "upload",
-                                 "drive_input_prefix": "vidio", **updates})
+                                 "drive_input_prefix": "vidio", "voice_session": "voice",
+                                 "tts_session": "tts", **updates})
 
 
 class FakePipeline(Pipeline):
@@ -104,6 +109,9 @@ class PlanTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        worker_patch = patch("pipeline.worker_lock", side_effect=lambda session: contextlib.nullcontext())
+        worker_patch.start()
+        self.addCleanup(worker_patch.stop)
         self.book, self.plan = fixture(self.temp.name)
 
     def add_second_shot(self):
@@ -134,6 +142,57 @@ class PlanTests(unittest.TestCase):
         compile_plan(self.book)
         self.assertEqual(read(path)["jobs"][0]["prompt_id"], "already-submitted")
         self.assertEqual(read(path)["jobs"][0]["audio_ids"], ["S001_SH001_A001", "S001_SH001_A002"])
+
+    def test_compile_freezes_stable_tts_seeds(self):
+        compile_plan(self.book)
+        first = [row["seed"] for row in read(self.book / "planning/tts_manifest.json")["jobs"]]
+        compile_plan(self.book)
+        second = [row["seed"] for row in read(self.book / "planning/tts_manifest.json")["jobs"]]
+        self.assertEqual(first, second)
+        self.assertTrue(all(isinstance(seed, int) and 0 <= seed < 2 ** 32 for seed in first))
+
+    def test_watcher_completion_matches_requested_endpoint(self):
+        compile_plan(self.book)
+        state_path = self.book / ".pipeline/state.json"
+        state_path.parent.mkdir(exist_ok=True)
+        atomic_json(state_path, {"status": "succeeded", "current_stage": "tts"})
+        self.assertFalse(pipeline_watcher._is_complete(self.book, arguments(until="video")))
+        self.assertTrue(pipeline_watcher._is_complete(self.book, arguments(until="tts")))
+        atomic_json(state_path, {"status": "succeeded", "current_stage": "video"})
+        self.assertFalse(pipeline_watcher._is_complete(
+            self.book, arguments(assemble=True, assembly_session="ComfyUI")))
+        atomic_json(state_path, {"status": "succeeded", "current_stage": "final"})
+        self.assertTrue(pipeline_watcher._is_complete(
+            self.book, arguments(assemble=True, assembly_session="ComfyUI")))
+
+    def test_watcher_routes_books_through_dependency_stages(self):
+        compile_plan(self.book)
+        state_path = self.book / ".pipeline/state.json"
+        state_path.parent.mkdir(exist_ok=True)
+        self.assertEqual(pipeline_watcher._next_stage(self.book, arguments()), "voice")
+        atomic_json(state_path, {"status": "ready_for_tts", "current_stage": "voice_design",
+                                 "stages": {"voice_design": {"status": "succeeded"}}})
+        self.assertEqual(pipeline_watcher._next_stage(self.book, arguments()), "tts")
+        atomic_json(state_path, {"status": "ready_for_video", "current_stage": "tts",
+                                 "stages": {"voice_design": {"status": "succeeded"},
+                                            "tts": {"status": "succeeded"}}})
+        self.assertEqual(pipeline_watcher._next_stage(self.book, arguments()), "video")
+        self.assertIsNone(pipeline_watcher._next_stage(self.book, arguments(until="tts")))
+        atomic_json(state_path, {"status": "ready_for_final", "current_stage": "video",
+                                 "stages": {"voice_design": {"status": "succeeded"},
+                                            "tts": {"status": "succeeded"},
+                                            "video": {"status": "succeeded"}}})
+        self.assertEqual(pipeline_watcher._next_stage(
+            self.book, arguments(assemble=True, assembly_session="tts")), "final")
+
+    def test_watcher_notification_is_deduplicated(self):
+        runtime = Path(self.temp.name) / ".pipeline"
+        runtime.mkdir()
+        state = {}
+        with patch.object(pipeline_watcher, "shutil_which", return_value=None):
+            pipeline_watcher._notify(runtime, state, "comfy:missing", "provide ComfyUI")
+            pipeline_watcher._notify(runtime, state, "comfy:missing", "provide ComfyUI")
+        self.assertEqual(len((runtime / "notifications.jsonl").read_text().splitlines()), 1)
 
     def test_video_duration_uses_measured_tts_with_padding(self):
         compile_plan(self.book)
@@ -176,6 +235,75 @@ class PlanTests(unittest.TestCase):
         result = apply_tts_video_durations(self.book)
         self.assertEqual(read(video_path)["jobs"][0]["inputs"]["duration_seconds"], 2)
         self.assertEqual(result["skipped_submitted"], ["S001_SH001"])
+
+    def test_ltx_prompt_is_action_first_and_prevents_camera_only_motion(self):
+        shutil.copyfile(LTX_TEMPLATE_DIR / "workflow_api.json", self.book / "comfyui/workflow_api.json")
+        shutil.copyfile(LTX_TEMPLATE_DIR / "bindings.json", self.book / "comfyui/bindings.json")
+        action = ("The child reaches down, grips the oar with both hands, and pulls it through the water; "
+                  "their shoulders turn while the boat advances and ripples spread behind it.")
+        self.plan["shots"][0]["video"].update(prompt=action, duration_seconds=5)
+        atomic_json(self.book / "planning/production_plan.json", self.plan)
+        compile_plan(self.book)
+        tts_path = self.book / "planning/tts_manifest.json"
+        tts = read(tts_path)
+        for row, seconds in zip(tts["jobs"], (1.5, 1.0)):
+            row.update(status="succeeded", seconds=seconds)
+        atomic_json(tts_path, tts)
+
+        self.assertEqual(refine_video_prompts(self.book)["changed"], ["S001_SH001"])
+        refinement = read(self.book / "planning/video_manifest.json")["jobs"][0]["prompt_refinement"]
+        prompt = refinement["prompt"]
+        self.assertEqual(refinement["version"], 4)
+        self.assertTrue(prompt.startswith(action))
+        self.assertLess(prompt.index("camera motion cannot be the sole"), prompt.index("Keep the source"))
+        self.assertIn("alone defines every subject's identity and count", prompt)
+        self.assertIn("existing or absent facial features", prompt)
+        self.assertIn("Never turn abstract or collage", prompt)
+        self.assertIn("Start immediately in the supplied composition", prompt)
+        self.assertIn("No intro, outro, transition", prompt)
+        self.assertIn("do not freeze", prompt)
+        self.assertNotIn("settle into a calm pose", prompt)
+        self.assertNotIn("First line.", prompt)
+        self.assertEqual(refinement["timeline"][0]["text"], "First line.")
+        self.assertLess(len(prompt.split()), 200)
+        self.assertIn("added anatomy or facial features absent from the reference image",
+                      refinement["negative_prompt"])
+        self.assertIn("slideshow, presentation animation", refinement["negative_prompt"])
+        self.assertIn("subject flying into frame", refinement["negative_prompt"])
+        job = read(self.book / "planning/video_manifest.json")["jobs"][0]
+        with patch.object(comfy_batch, "upload", return_value="uploaded.png"):
+            workflow = comfy_batch.build_workflow(self.batch_context(), job)
+        bindings = read(self.book / "comfyui/bindings.json")
+        negative_binding = bindings["negative_prompt"]
+        self.assertEqual(workflow[str(negative_binding["node"])]["inputs"][negative_binding["input"]],
+                         refinement["negative_prompt"])
+
+    def test_ltx_prompt_enhancement_is_bypassed(self):
+        workflow = read(LTX_TEMPLATE_DIR / "workflow_api.json")
+        switch = workflow["398:382"]["inputs"]
+        self.assertFalse(workflow["398:383"]["inputs"]["value"])
+        self.assertEqual(workflow[switch["on_false"][0]]["class_type"], "PrimitiveStringMultiline")
+        self.assertEqual(workflow[switch["on_true"][0]]["class_type"], "TextGenerateLTX2Prompt")
+        self.assertEqual(workflow["398:364"]["inputs"]["text"], ["398:382", 0])
+
+    def test_ltx_prompt_refinement_does_not_rewrite_submitted_job(self):
+        shutil.copyfile(LTX_TEMPLATE_DIR / "workflow_api.json", self.book / "comfyui/workflow_api.json")
+        shutil.copyfile(LTX_TEMPLATE_DIR / "bindings.json", self.book / "comfyui/bindings.json")
+        compile_plan(self.book)
+        tts_path = self.book / "planning/tts_manifest.json"
+        tts = read(tts_path)
+        for row in tts["jobs"]:
+            row.update(status="succeeded", seconds=0.5)
+        atomic_json(tts_path, tts)
+        video_path = self.book / "planning/video_manifest.json"
+        video = read(video_path)
+        video["jobs"][0].update(status="queued", prompt_id="already-submitted",
+                                prompt_refinement={"version": 1, "prompt": "frozen prompt"})
+        atomic_json(video_path, video)
+
+        self.assertEqual(refine_video_prompts(self.book)["changed"], [])
+        current = read(video_path)["jobs"][0]["prompt_refinement"]
+        self.assertEqual(current, {"version": 1, "prompt": "frozen prompt"})
 
     def test_changed_asset_rejected_before_overwrite(self):
         compile_plan(self.book)
@@ -233,21 +361,36 @@ class PlanTests(unittest.TestCase):
             runner.bundle("fake", plan, fingerprint)
 
     @patch("comfy_batch.request_json", side_effect=lambda url: TEMPLATE_OBJECT_INFO)
-    def test_pipeline_orders_cleanup_before_video(self, request):
+    def test_pipeline_routes_voice_and_tts_without_stopping_workers(self, request):
         runner = FakePipeline(self.book, arguments())
         runner.run()
         self.assertLess(runner.calls.index(("remote", "voice")), runner.calls.index(("remote", "tts")))
-        self.assertLess(runner.calls.index(("colab", "stop")), runner.calls.index(("command", "video")))
+        self.assertNotIn(("colab", "new"), runner.calls)
+        self.assertNotIn(("colab", "drivemount"), runner.calls)
+        self.assertNotIn(("colab", "stop"), runner.calls)
         self.assertEqual(runner.state["status"], "succeeded")
+        self.assertEqual(runner.state["workers"], {"voice": "voice", "tts": "tts"})
         self.assertNotIn(("remote", "final"), runner.calls)
 
-    def test_tts_failure_stops_only_owned_gpu(self):
+    def test_completed_voice_design_goes_directly_to_tts(self):
+        compile_plan(self.book)
+        state_path = self.book / ".pipeline/state.json"
+        state_path.parent.mkdir(exist_ok=True)
+        atomic_json(state_path, {"schema_version": 1, "status": "ready_for_tts",
+                                 "current_stage": "voice_design",
+                                 "stages": {"voice_design": {"status": "succeeded"}}})
+        runner = FakePipeline(self.book, arguments(until="tts"))
+        runner.run()
+        self.assertNotIn(("remote", "voice"), runner.calls)
+        self.assertIn(("remote", "tts"), runner.calls)
+        self.assertEqual(runner.state["status"], "succeeded")
+
+    def test_tts_failure_leaves_user_owned_workers_running(self):
         runner = FakePipeline(self.book, arguments(), fail="tts")
         with self.assertRaises(RuntimeError):
             runner.run()
-        self.assertIn(("colab", "stop"), runner.calls)
+        self.assertNotIn(("colab", "stop"), runner.calls)
         self.assertNotIn(("command", "video"), runner.calls)
-        self.assertIsNone(runner.state["l4_session"])
 
     def test_missing_url_does_not_undo_completed_tts(self):
         runner = FakePipeline(self.book, arguments(comfy_url=None))
@@ -258,55 +401,39 @@ class PlanTests(unittest.TestCase):
         resumed.run()
         self.assertNotIn(("colab", "new"), resumed.calls)
 
-    def test_oauth_needs_input_cleans_up(self):
-        runner = FakePipeline(self.book, arguments(), fail="drive")
-        with self.assertRaises(RuntimeError):
-            runner.run()
-        self.assertEqual(runner.state["status"], "failed")
-        self.assertIn(("colab", "stop"), runner.calls)
-
-    def test_authorized_session_is_adopted_without_remount_or_reallocation(self):
-        runner = FakePipeline(self.book, arguments(until="tts"))
-        runner.prepare_l4()
-        authorized = runner.state["l4_session"]
-        self.assertEqual(runner.state["l4_handoff"], "ready")
-        resumed = FakePipeline(self.book, arguments(until="tts"))
-        resumed.run()
-        self.assertNotIn(("colab", "new"), resumed.calls)
-        self.assertNotIn(("colab", "drivemount"), resumed.calls)
-        self.assertLess(resumed.calls.index(("remote", "tts")), resumed.calls.index(("colab", "stop")))
-        self.assertEqual(resumed.state["l4_cleanup"]["session"], authorized)
-
-    def test_no_terminal_rejected_before_gpu_allocation(self):
-        runner = Pipeline(self.book, arguments())
-        with patch("sys.stdin.isatty", return_value=False), patch.object(runner, "colab") as command:
-            with self.assertRaises(NeedsInput):
-                runner.prepare_l4()
-        command.assert_not_called()
-        self.assertEqual(runner.state["status"], "needs_input")
-
-    def test_mount_inherits_live_terminal_input_and_output(self):
-        runner = FakePipeline(self.book, arguments())
-        with patch.object(runner, "colab") as command:
-            runner.prepare_l4()
-        mount = next(c for c in command.call_args_list if c.args[0] == "drivemount")
-        self.assertTrue(mount.kwargs["interactive"])
-        self.assertEqual(mount.args, ("drivemount", "-s", runner.state["l4_session"]))
-        # Exercise the actual command boundary, not just the high-level mock.
-        real = Pipeline(self.book, arguments())
-        with patch("subprocess.run") as run:
-            run.return_value.returncode = 0
-            real.command(["colab", "drivemount", "-s", "fake"], "mount", interactive=True)
-        self.assertIsNone(run.call_args.kwargs["stdin"])
-        self.assertIsNone(run.call_args.kwargs["stdout"])
-
     @patch("comfy_batch.request_json", return_value=TEMPLATE_OBJECT_INFO)
     def test_final_is_explicit_and_uses_existing_session(self, request):
         runner = FakePipeline(self.book, arguments(assemble=True, assembly_session="user-a100"))
+        fake_command = runner.command
+        def command(argv, name, *args, **kwargs):
+            fake_command(argv, name, *args, **kwargs)
+            if name == "video":
+                path = self.book / "planning/video_manifest.json"
+                data = read(path)
+                for job in data["jobs"]:
+                    job["status"] = "succeeded"
+                atomic_json(path, data)
+        runner.command = command
         runner.run()
-        self.assertEqual(runner.calls.count(("colab", "new")), 1)
-        self.assertEqual(runner.calls.count(("colab", "stop")), 1)
+        self.assertEqual(runner.calls.count(("colab", "new")), 0)
+        self.assertEqual(runner.calls.count(("colab", "stop")), 0)
         self.assertIn(("remote", "final"), runner.calls)
+
+    @patch("comfy_batch.request_json", return_value=TEMPLATE_OBJECT_INFO)
+    def test_video_stage_releases_comfy_before_final_stage(self, request):
+        runner = FakePipeline(self.book, arguments(assemble=True, assembly_session="ComfyUI"))
+        runner.state["stages"].update(voice_design={"status": "succeeded"},
+                                      tts={"status": "succeeded"})
+        compile_plan(self.book)
+        tts_path = self.book / "planning/tts_manifest.json"
+        tts = read(tts_path)
+        for row in tts["jobs"]:
+            row.update(status="succeeded", seconds=0.5)
+        atomic_json(tts_path, tts)
+        runner.run_stage("video")
+        self.assertIn(("command", "video"), runner.calls)
+        self.assertNotIn(("remote", "final"), runner.calls)
+        self.assertEqual(runner.state["status"], "ready_for_final")
 
     def test_history_timeout_retains_prompt_without_resubmit(self):
         compile_plan(self.book)
@@ -320,6 +447,28 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(read(path)["jobs"][0]["status"], "running")
         self.assertEqual(read(path)["jobs"][0]["prompt_id"], "pid")
         self.assertFalse(any(call.args[0].endswith("/prompt") for call in request.call_args_list))
+
+    def test_history_images_mp4_recovers_failed_job_without_resubmit(self):
+        compile_plan(self.book)
+        path = self.book / "planning/video_manifest.json"
+        jobs = read(path)["jobs"]
+        jobs[0].update(status="failed", prompt_id="pid", attempts=1, post_attempts=1,
+                       error="no output files")
+        atomic_json(path, {"jobs": jobs})
+        history = {"pid": {"status": {"status_str": "success"}, "outputs": {"75": {
+            "images": [{"filename": "S001_SH001_00001_.mp4",
+                        "subfolder": "books/example/video/shots", "type": "output"}],
+            "animated": [True],
+        }}}}
+        with patch.object(comfy_batch, "request_json", side_effect=({"queue_pending": [], "queue_running": []}, history)), \
+                patch.object(comfy_batch, "upload") as upload:
+            comfy_batch.reconcile_jobs(self.batch_context(), jobs, jobs)
+            comfy_batch.submit_batch(self.batch_context(), jobs, jobs)
+        current = read(path)["jobs"][0]
+        self.assertEqual(current["status"], "succeeded")
+        self.assertEqual(current["remote_filename"], "S001_SH001_00001_.mp4")
+        self.assertEqual(current["post_attempts"], 1)
+        upload.assert_not_called()
 
     def test_unknown_submission_blocks_retry(self):
         compile_plan(self.book)

@@ -18,6 +18,7 @@ from production_plan import compile_plan, digest, import_legacy, read, relative,
 from projectctl import atomic_json
 
 HERE = Path(__file__).resolve().parent
+PROJECT_ROOT = HERE.parents[3]
 DRIVE = Path("/content/drive/MyDrive/vidio")
 
 
@@ -41,6 +42,17 @@ def project_lock(book, inherited_fd=None):
         yield handle
 
 
+@contextlib.contextmanager
+def worker_lock(session):
+    """Serialize all local access to one persistent Colab worker."""
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in session)
+    folder = PROJECT_ROOT / ".pipeline" / "workers"
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / f"{safe}.lock").open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
 class Pipeline:
     def __init__(self, book, args):
         self.book, self.args = book, args
@@ -60,22 +72,21 @@ class Pipeline:
         summary = read(summary_path) if summary_path.exists() else {"schema_version": 1, "book_slug": self.book.name, "stages": {}}
         summary.setdefault("stages", {}).update(self.state["stages"])
         summary.update(pipeline_status=self.state.get("status"), updated_at=self.state["updated_at"],
-                       l4_cleanup=self.state.get("l4_cleanup"), l4_session=self.state.get("l4_session"))
+                       workers=self.state.get("workers"))
         atomic_json(summary_path, summary)
 
-    def command(self, argv, name, timeout=None, interactive=False):
+    def command(self, argv, name, timeout=None):
         log = self.log_dir / f"{name}.log"
         with log.open("a") as handle:
             handle.write("\nCOMMAND " + shlex.join(argv) + "\n"); handle.flush()
-            result = subprocess.run(argv, stdin=None if interactive else subprocess.DEVNULL,
-                                    stdout=None if interactive else handle,
-                                    stderr=None if interactive else subprocess.STDOUT,
+            result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=handle,
+                                    stderr=subprocess.STDOUT,
                                     timeout=timeout or self.args.timeout, check=False)
         if result.returncode:
             raise RuntimeError(f"{name} exited {result.returncode}; see {log}")
 
-    def colab(self, *args, name="colab", timeout=None, interactive=False):
-        self.command(["colab", *map(str, args)], name, timeout, interactive)
+    def colab(self, *args, name="colab", timeout=None):
+        self.command(["colab", *map(str, args)], name, timeout)
 
     def execute(self, session, code, name, timeout=None):
         script = self.folder / f"{name}.py"
@@ -168,8 +179,15 @@ with tarfile.open({remote_archive!r}) as tar:
             key='audio_id' if 'tts_manifest' in member.name else 'shot_id'
             old={{row[key]:row for row in prior}}
             assert set(old)=={{row[key] for row in incoming}}, 'Drive manifest IDs differ'
-            fields=('text','role_id','lang','emotion_vector','duration_factor','output','reference_voice') if key=='audio_id' else ('inputs','workflow','bindings','output')
+            migrated=False
+            if key=='audio_id':
+                for row in incoming:
+                    if 'seed' not in old[row[key]]:
+                        old[row[key]]['seed']=row['seed']; migrated=True
+            fields=('text','role_id','lang','emotion_vector','duration_factor','seed','output','reference_voice') if key=='audio_id' else ('inputs','workflow','bindings','output')
             assert all(all(old[row[key]].get(k)==row.get(k) for k in fields) for row in incoming), 'Drive manifest inputs differ'
+            if migrated:
+                target.write_text(json.dumps({{'jobs':prior}}))
             continue
         target.parent.mkdir(parents=True,exist_ok=True)
         with tar.extractfile(member) as src, target.open('wb') as dst: shutil.copyfileobj(src,dst)
@@ -209,134 +227,91 @@ Path({remote_archive!r}).unlink()
         self.state["stages"][name].update(status="succeeded", completed_at=time.time())
         self.save()
 
-    def stop_l4(self):
-        session = self.state.get("l4_session")
-        if not session:
-            return
-        try:
-            self.colab("stop", "-s", session, name="stop-l4", timeout=120)
-        except Exception:
-            pass
-        self.colab("sessions", name="verify-stop", timeout=120)
-        # Match the exact name in the CLI's server-synchronized session listing.
-        import re
-        listing = (self.log_dir / "verify-stop.log").read_text().split("COMMAND colab sessions")[-1]
-        if re.search(r"(?<![\w-])" + re.escape(session) + r"(?![\w-])", listing):
-            raise RuntimeError(f"L4 is still listed: {session}")
-        self.save(l4_session=None, l4_handoff=None, l4_cleanup={"status": "succeeded", "session": session})
-
-    def require_terminal(self):
-        if not sys.stdin.isatty() or not sys.stdout.isatty():
-            raise NeedsInput("Drive authorization needs a persistent PTY. Run pipeline.py start in a PTY; open its authorization URL and return any code to that same terminal.")
-
-    def prepare_l4(self):
-        """Complete browser-assisted authorization before detaching the supervisor."""
+    def prepare_workers(self):
+        """Verify the user-owned persistent workers without changing them."""
         _, fingerprint = compile_plan(self.book)
         if self.state.get("plan_hash", fingerprint) != fingerprint:
             raise ValueError("pipeline state belongs to another production plan")
+        workers = {"voice": self.args.voice_session, "tts": self.args.tts_session}
+        self.save(status="checking_workers", plan_hash=fingerprint, workers=workers, error=None)
         if self.state["stages"].get("tts", {}).get("status") == "succeeded":
             return
-        if self.state.get("l4_session") and self.state.get("l4_handoff") == "ready":
-            try:
-                self.probe(self.state["l4_session"], gpu=True)
-            except BaseException as exc:
-                self.save(status="failed", error=str(exc))
-                self.stop_l4()
-                raise
-            return
-        # Check before allocating or touching an existing runtime.
-        try:
-            self.require_terminal()
-        except NeedsInput as exc:
-            self.save(status="needs_input", error=str(exc))
-            raise
-        if self.state.get("l4_session"):
-            self.stop_l4()
-        session = f"bookdash-{self.book.name}-tts-{uuid.uuid4().hex[:8]}"
-        self.save(status="authorizing", plan_hash=fingerprint, l4_session=session,
-                  l4_handoff="authorizing", error=None)
-        try:
-            self.stage("l4", lambda: self.colab("new", "-s", session, "--gpu", "L4", name="start-l4", timeout=300))
-            def mount():
-                # Inherit the live PTY, including stdin. Keep this exact process
-                # alive while the agent completes Google consent in the browser.
-                self.colab("drivemount", "-s", session, name="mount-drive", timeout=1800, interactive=True)
-                self.probe(session, gpu=True)
-            self.stage("drive", mount)
-            self.save(status="ready", l4_handoff="ready")
-        except BaseException as exc:
-            self.state["stages"].setdefault(self.current, {}).update(status="failed", error=str(exc))
-            self.save(status="failed", error=str(exc))
-            self.stop_l4()
-            raise
+        # Probe both on every unfinished book. The remote stages validate their
+        # own outputs, so a lost Drive artifact is recovered even if local state
+        # says a previous attempt succeeded.
+        needed = [("voice_worker", workers["voice"]), ("tts_worker", workers["tts"])]
+        for stage_name, session in needed:
+            with worker_lock(session):
+                self.stage(stage_name, lambda session=session: self.probe(session, gpu=True))
+        self.save(status="ready")
 
-    def run(self):
+    def run_stage(self, requested_stage):
+        """Run exactly one resumable pipeline stage for queue scheduling."""
         plan, plan_hash = compile_plan(self.book)
         if self.state.get("plan_hash", plan_hash) != plan_hash:
             raise ValueError("pipeline state belongs to another production plan")
         self.save(status="running", pid=os.getpid(), plan_hash=plan_hash, error=None,
-                  drive_project=str(self.remote_book), assemble=self.args.assemble)
+                  drive_project=str(self.remote_book), assemble=self.args.assemble,
+                  workers={"voice": self.args.voice_session, "tts": self.args.tts_session},
+                  queued_stage=requested_stage)
         try:
-            # A verified authorization handoff is deliberately adopted, not stopped.
-            if self.state.get("l4_session") and (self.state.get("l4_handoff") != "ready" or self.state["stages"].get("tts", {}).get("status") == "succeeded"):
-                self.stop_l4()
-            if self.state["stages"].get("tts", {}).get("status") != "succeeded":
-                self.prepare_l4()
-                session = self.state["l4_session"]
-                try:
-                    self.save(status="running", l4_handoff="consumed")
-                    def inputs():
-                        self.bundle(session, plan, plan_hash)
-                        self.sync(session, ["planning/tts_manifest.json", "planning/video_manifest.json"])
-                    self.stage("inputs", inputs)
-                    script = str(self.remote_book / "pipeline_scripts/remote_stages.py")
-                    self.stage("voice_design", lambda: self.remote_stage(session, "voice", ["python", script, "voice", "--book-dir", str(self.remote_book)]))
-                    def synthesize():
-                        self.remote_stage(session, "tts", ["python", script, "tts", "--book-dir", str(self.remote_book)])
-                        self.sync(session, ["planning/tts_manifest.json", "planning/video_manifest.json", "qa/tts_validation.json", "qa/voice_selection.json", "qa/subtitle_alignment.json"])
-                    self.stage("tts", synthesize)
-                finally:
-                    self.stop_l4()
-            if self.args.until == "tts":
-                self.save(status="succeeded", current_stage="tts")
+            if requested_stage == "voice":
+                if self.state["stages"].get("voice_design", {}).get("status") == "succeeded":
+                    self.save(status="ready_for_tts", current_stage="voice_design")
+                    return
+                script = str(self.remote_book / "pipeline_scripts/remote_stages.py")
+                with worker_lock(self.args.voice_session):
+                    self.stage("voice_worker", lambda: self.probe(self.args.voice_session, gpu=True))
+                    def voice_inputs():
+                        self.bundle(self.args.voice_session, plan, plan_hash)
+                        self.sync(self.args.voice_session, ["planning/tts_manifest.json", "planning/video_manifest.json"])
+                    self.stage("inputs", voice_inputs)
+                    self.stage("voice_design", lambda: self.remote_stage(
+                        self.args.voice_session, "voice",
+                        ["python", script, "voice", "--book-dir", str(self.remote_book)]))
+                    self.sync(self.args.voice_session, ["qa/voice_selection.json"])
+                self.save(status="ready_for_tts", current_stage="voice_design")
                 return
-            from production_plan import apply_tts_video_durations
-            apply_tts_video_durations(self.book)
-            from video_prompt import refine_video_prompts
-            self.stage("video_prompt", lambda: refine_video_prompts(self.book))
-            if not self.args.comfy_url:
-                raise NeedsInput("TTS complete. Supply --comfy-url for the user-run ComfyUI endpoint and resume.")
-            from comfy_batch import request_json
-            try:
-                base = self.args.comfy_url.split("#")[0].rstrip("/")
-                request_json(base + "/system_stats")
-                info = request_json(base + "/object_info")
-                missing = {node["class_type"] for node in read(relative(self.book, plan["workflow"])).values()} - set(info)
-                if missing:
-                    raise ValueError(f"missing ComfyUI nodes: {sorted(missing)}")
-            except Exception as exc:
-                raise NeedsInput(f"ComfyUI endpoint needs attention: {exc}") from exc
-            atomic_json(self.book / "comfyui/endpoint.json", {"base_url": base, "checked_at": time.time()})
-            self.save(comfy_url=base)
-            video_command = [sys.executable, str(HERE / "comfy_batch.py"), "--book-dir", str(self.book),
-                             "--base-url", base, "--timeout", str(self.args.shot_timeout),
-                             "--reference-mode", self.args.reference_mode,
-                             "--drive-input-prefix", self.args.drive_input_prefix]
-            if self.args.comfy_restarted:
-                video_command.append("--comfy-restarted")
-            self.stage("video", lambda: self.command(video_command, "video", timeout=self.args.timeout))
-            if self.args.assemble:
-                if not self.args.assembly_session:
-                    raise NeedsInput("Videos complete. Supply --assembly-session for the existing A100 with this Drive mounted.")
-                session = self.args.assembly_session
-                self.probe(session)
-                # Transfer JSON/scripts only; generated media remain on Drive.
-                self.bundle(session, plan, plan_hash)
-                remote_manifest = self.remote_book / "planning/video_manifest.json"
-                self.colab("upload", "-s", session, self.book / "planning/video_manifest.json", remote_manifest, name="upload-video-metadata", timeout=120)
-                self.stage("final", lambda: self.remote_stage(session, "final", ["python", str(self.remote_book / "pipeline_scripts/assemble_final.py"), "--book-dir", str(self.remote_book)]))
-                self.sync(session, ["video/final/assembly_manifest.json"])
-            self.save(status="succeeded", current_stage="final" if self.args.assemble else "video")
+
+            if requested_stage == "tts":
+                if self.state["stages"].get("voice_design", {}).get("status") != "succeeded":
+                    raise NeedsInput("VoiceDesign must succeed before TTS can start")
+                if self.state["stages"].get("tts", {}).get("status") == "succeeded":
+                    status = "succeeded" if self.args.until == "tts" else "ready_for_video"
+                    self.save(status=status, current_stage="tts")
+                    return
+                script = str(self.remote_book / "pipeline_scripts/remote_stages.py")
+                with worker_lock(self.args.tts_session):
+                    self.stage("tts_worker", lambda: self.probe(self.args.tts_session, gpu=True))
+                    # Re-bundle scripts and immutable inputs on the TTS VM.
+                    # Selected voices already live on the shared Drive.
+                    self.stage("tts_inputs", lambda: self.bundle(self.args.tts_session, plan, plan_hash))
+                    def synthesize_persistent():
+                        self.remote_stage(self.args.tts_session, "tts", [
+                            "python", script, "tts", "--book-dir", str(self.remote_book)])
+                        self.sync(self.args.tts_session, ["planning/tts_manifest.json", "planning/video_manifest.json",
+                                  "qa/tts_validation.json", "qa/voice_selection.json", "qa/subtitle_alignment.json"])
+                    self.stage("tts", synthesize_persistent)
+                status = "succeeded" if self.args.until == "tts" else "ready_for_video"
+                self.save(status=status, current_stage="tts")
+                return
+
+            if requested_stage == "video":
+                if self.state["stages"].get("tts", {}).get("status") != "succeeded":
+                    raise NeedsInput("TTS must succeed before video can start")
+                self.run_video(plan, plan_hash)
+                return
+
+            if requested_stage == "final":
+                if self.state["stages"].get("video", {}).get("status") != "succeeded":
+                    raise NeedsInput("Every required video must succeed before final assembly")
+                if not self.args.assemble:
+                    self.save(status="succeeded", current_stage="video")
+                    return
+                self.run_final(plan, plan_hash)
+                return
+
+            raise ValueError(f"unknown pipeline stage: {requested_stage}")
         except BaseException as exc:
             status = "needs_input" if isinstance(exc, NeedsInput) else "failed"
             if self.state["stages"].get(self.current, {}).get("status") == "running":
@@ -344,14 +319,94 @@ Path({remote_archive!r}).unlink()
             self.save(status=status, error=str(exc))
             raise
 
+    def run(self):
+        if self.state["stages"].get("voice_design", {}).get("status") != "succeeded":
+            self.run_stage("voice")
+        if self.state["stages"].get("tts", {}).get("status") != "succeeded":
+            self.run_stage("tts")
+        if self.args.until == "tts":
+            self.save(status="succeeded", current_stage="tts")
+            return
+        if self.state["stages"].get("video", {}).get("status") != "succeeded":
+            self.run_stage("video")
+        if self.args.assemble and self.state["stages"].get("final", {}).get("status") != "succeeded":
+            self.run_stage("final")
+        elif not self.args.assemble:
+            self.save(status="succeeded", current_stage="video")
+
+    def run_video(self, plan, plan_hash):
+        from production_plan import apply_tts_video_durations
+        apply_tts_video_durations(self.book)
+        from video_prompt import refine_video_prompts
+        self.stage("video_prompt", lambda: refine_video_prompts(self.book))
+        if not self.args.comfy_url:
+            raise NeedsInput("TTS complete. No healthy ComfyUI endpoint is configured; update the repository url file.")
+        try:
+            from comfy_batch import request_json
+            base = self.args.comfy_url.split("#")[0].rstrip("/")
+            request_json(base + "/system_stats")
+            info = request_json(base + "/object_info")
+            missing = {node["class_type"] for node in read(relative(self.book, plan["workflow"])).values()} - set(info)
+            if missing:
+                raise ValueError(f"missing ComfyUI nodes: {sorted(missing)}")
+        except Exception as exc:
+            raise NeedsInput(f"ComfyUI endpoint needs attention: {exc}") from exc
+        atomic_json(self.book / "comfyui/endpoint.json", {"base_url": base, "checked_at": time.time()})
+        self.save(comfy_url=base)
+        video_command = [sys.executable, str(HERE / "comfy_batch.py"), "--book-dir", str(self.book),
+                         "--base-url", base, "--timeout", str(self.args.shot_timeout),
+                         "--reference-mode", self.args.reference_mode,
+                         "--drive-input-prefix", self.args.drive_input_prefix]
+        if self.args.comfy_restarted:
+            video_command.append("--comfy-restarted")
+        self.stage("video", lambda: self.command(video_command, "video", timeout=self.args.timeout))
+        self.save(status="ready_for_final" if self.args.assemble else "succeeded",
+                  current_stage="video")
+
+    def run_final(self, plan, plan_hash):
+        if not self.args.assembly_session:
+            raise NeedsInput("Videos complete. Supply the existing ComfyUI session for final assembly.")
+        jobs = read(self.book / "planning/video_manifest.json")["jobs"]
+        incomplete = [job["shot_id"] for job in jobs
+                      if job.get("required", True) and job.get("status") != "succeeded"]
+        if incomplete:
+            raise NeedsInput(f"Videos incomplete before final assembly: {incomplete}")
+        session = self.args.assembly_session
+        with worker_lock("final-" + session):
+            self.probe(session)
+            self.bundle(session, plan, plan_hash)
+            remote_manifest = self.remote_book / "planning/video_manifest.json"
+            self.colab("upload", "-s", session, self.book / "planning/video_manifest.json", remote_manifest, name="upload-video-metadata", timeout=120)
+            self.stage("final", lambda: self.remote_stage(session, "final", [
+                "nice", "-n", "15", "ionice", "-c", "3", "python",
+                str(self.remote_book / "pipeline_scripts/assemble_final.py"),
+                "--book-dir", str(self.remote_book)]))
+            self.sync(session, ["video/final/assembly_manifest.json"])
+        self.save(status="succeeded", current_stage="final")
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("command", choices=["import-legacy", "validate", "compile", "start", "run", "status", "stop-l4"])
-    ap.add_argument("--book-dir", required=True)
+    ap.add_argument("command", choices=["import-legacy", "validate", "compile", "start", "run", "status",
+                                        "watch-start", "watch", "watch-status"])
+    ap.add_argument("--book-dir")
+    ap.add_argument("--books-dir", default=str(PROJECT_ROOT / "books"))
     ap.add_argument("--comfy-url")
-    ap.add_argument("--assembly-session")
-    ap.add_argument("--assemble", action="store_true", help="explicitly request final narrated MP4")
+    ap.add_argument("--comfy-url-file", default=str(PROJECT_ROOT / "url"))
+    ap.add_argument("--voice-session", default="voice", help="existing user-owned L4 for VoiceDesign")
+    ap.add_argument("--tts-session", default="tts", help="existing user-owned L4 for IndexTTS")
+    ap.add_argument("--scan-interval", type=float, default=15,
+                    help="watcher seconds between scans when idle")
+    ap.add_argument("--retry-delay", type=float, default=60,
+                    help="watcher minimum seconds before retrying a failed book")
+    ap.add_argument("--assembly-session", default="ComfyUI",
+                    help="existing Drive-mounted session used for automatic final assembly")
+    assembly = ap.add_mutually_exclusive_group()
+    assembly.add_argument("--assemble", dest="assemble", action="store_true",
+                          help="assemble the final narrated MP4 after all shots succeed (default)")
+    assembly.add_argument("--no-assemble", dest="assemble", action="store_false",
+                          help="stop after individual shot videos succeed")
+    ap.set_defaults(assemble=True)
     ap.add_argument("--until", choices=["tts", "video"], default="video")
     ap.add_argument("--timeout", type=int, default=14400, help="maximum seconds per stage")
     ap.add_argument("--shot-timeout", type=int, default=3600)
@@ -361,18 +416,25 @@ def main():
                     help="use uploaded images, or references directly from the ComfyUI Drive input mapping")
     ap.add_argument("--drive-input-prefix", default="vidio",
                     help="relative ComfyUI input/ path mapped to the shared Drive root")
-    ap.add_argument("--interactive", action="store_true", help="allow foreground Drive OAuth consent")
     ap.add_argument("--lock-fd", type=int, help=argparse.SUPPRESS)
     args = ap.parse_args()
     def interrupted(signum, frame):
         raise KeyboardInterrupt(f"interrupted by signal {signum}")
     signal.signal(signal.SIGTERM, interrupted)
-    book = Path(args.book_dir).expanduser().resolve()
     try:
-        if args.timeout <= 0 or args.shot_timeout <= 0:
+        if args.timeout <= 0 or args.shot_timeout <= 0 or args.scan_interval <= 0 or args.retry_delay <= 0:
             raise ValueError("timeouts must be positive")
         if args.assemble and args.until == "tts":
             raise ValueError("--assemble conflicts with --until tts")
+        if args.voice_session == args.tts_session:
+            raise ValueError("--voice-session and --tts-session must name two distinct L4 sessions")
+        if args.command in ("watch-start", "watch", "watch-status"):
+            from pipeline_watcher import dispatch
+            dispatch(args)
+            return
+        if not args.book_dir:
+            raise ValueError("--book-dir is required for this command")
+        book = Path(args.book_dir).expanduser().resolve()
         if args.command == "status":
             print(json.dumps(read(book / ".pipeline/state.json"), ensure_ascii=False, indent=2)); return
         if args.command == "validate":
@@ -382,15 +444,11 @@ def main():
             with project_lock(book) as lock:
                 compile_plan(book)
                 pipeline = Pipeline(book, args)
-                pipeline.prepare_l4()
+                pipeline.prepare_workers()
                 folder = book / ".pipeline"
-                try:
-                    with (folder / "supervisor.log").open("a") as log:
-                        argv = [sys.executable, str(Path(__file__).resolve()), "run", *sys.argv[2:], "--lock-fd", str(lock.fileno())]
-                        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(lock.fileno(),))
-                except BaseException:
-                    pipeline.stop_l4()
-                    raise
+                with (folder / "supervisor.log").open("a") as log:
+                    argv = [sys.executable, str(Path(__file__).resolve()), "run", *sys.argv[2:], "--lock-fd", str(lock.fileno())]
+                    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(lock.fileno(),))
             print(json.dumps({"launched_pid": process.pid, "state": str(folder / "state.json"), "log": str(folder / "supervisor.log")})); return
         with project_lock(book, args.lock_fd):
             if args.command == "import-legacy":
@@ -398,8 +456,6 @@ def main():
             if args.command == "compile":
                 _, fingerprint = compile_plan(book); print(fingerprint); return
             pipeline = Pipeline(book, args)
-            if args.command == "stop-l4":
-                pipeline.stop_l4(); return
             pipeline.run()
     except NeedsInput as exc:
         print(str(exc), file=sys.stderr); raise SystemExit(2)

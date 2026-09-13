@@ -11,6 +11,21 @@ from pathlib import Path
 from production_plan import apply_tts_video_durations, read, relative
 from projectctl import atomic_json
 
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+
+def seed_everything(seed):
+    """Reset all model RNGs at each persisted unit of work."""
+    import numpy as np
+    import torch
+    random.seed(seed)
+    np.random.seed(seed % (2 ** 32))
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
 
 def audio_qa(path, minimum=0.15, maximum=120):
     import numpy as np
@@ -66,7 +81,7 @@ def voices(book):
                 if model is None:
                     from qwen_tts import Qwen3TTSModel
                     model = Qwen3TTSModel.from_pretrained("Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign", device_map="cuda:0", dtype=torch.bfloat16, attn_implementation="sdpa")
-                random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+                seed_everything(seed)
                 wavs, sr = model.generate_voice_design(text=spec["reference_text"], language=spec["language"], instruct=spec["instruct"], do_sample=True, temperature=spec.get("temperature", .9), top_p=spec.get("top_p", .95))
                 temp = path.with_suffix(".tmp.wav")
                 sf.write(temp, wavs[0], sr, subtype="PCM_16")
@@ -98,6 +113,7 @@ def tts(book, model_dir):
         temporary = output.with_suffix(".tmp.wav")
         output.parent.mkdir(parents=True, exist_ok=True)
         try:
+            seed_everything(job["seed"])
             if model is None:
                 model = IndexTTS2(cfg_path=str(model_dir / "config.yaml"), model_dir=str(model_dir), use_bf16=True)
             kwargs = {"emo_vector": job["emotion_vector"]} if "emotion_vector" in job else {}

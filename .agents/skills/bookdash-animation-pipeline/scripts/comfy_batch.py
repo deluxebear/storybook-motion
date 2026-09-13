@@ -123,7 +123,9 @@ def mark_lost_after_restart(job, base):
 
 
 def reconcile_jobs(context, jobs, selected):
-    candidates = [job for job in selected if job.get("status") in {"submitting", "queued", "running"}]
+    candidates = [job for job in selected
+                  if job.get("status") in {"submitting", "queued", "running"}
+                  or (job.get("status") == "failed" and job.get("prompt_id"))]
     if not candidates:
         return
     try:
@@ -158,7 +160,7 @@ def reconcile_jobs(context, jobs, selected):
         if prompt_id in queue:
             job.update(status=queue[prompt_id]["status"], error=None)
         elif prompt_id in history_payload:
-            job["error"] = None
+            finish_job(context, job, history_payload[prompt_id])
         elif context.restart_confirmed or (job.get("endpoint") and job["endpoint"] != context.base):
             mark_lost_after_restart(job, context.base)
     context.save(jobs)
@@ -174,8 +176,9 @@ def build_workflow(context, job):
         "seed": inputs.get("seed", 0),
         "output_prefix": f"{context.drive_prefix}/{job['shot_id']}",
     }
-    if "negative_prompt" in inputs:
-        values["negative_prompt"] = inputs["negative_prompt"]
+    negative_prompt = job.get("prompt_refinement", {}).get("negative_prompt", inputs.get("negative_prompt"))
+    if negative_prompt:
+        values["negative_prompt"] = negative_prompt
     if "duration_seconds" in inputs:
         values["duration_seconds"] = inputs["duration_seconds"]
         if any(n["class_type"] == "LTXVConditioning" for n in workflow.values()):
@@ -253,7 +256,7 @@ def finish_job(context, job, history):
         return
     files = []
     for node in history.get("outputs", {}).values():
-        files.extend(node.get("videos", []) + node.get("gifs", []))
+        files.extend(node.get("videos", []) + node.get("gifs", []) + node.get("images", []))
     files = [item for item in files
              if Path(item.get("filename", "")).suffix.lower() in {".mp4", ".webm", ".mov"}
              and item.get("type", "output") == "output"]

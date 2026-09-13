@@ -151,6 +151,8 @@ def validate(root, plan):
             seen_audio.add(aid)
             if not line.get("text", "").strip() or not line.get("lang", "").strip():
                 raise ValueError(f"{aid}: text and lang are required")
+            if "seed" in line and (not isinstance(line["seed"], int) or not 0 <= line["seed"] < 2 ** 32):
+                raise ValueError(f"{aid}: seed must be a 32-bit unsigned integer")
             positive(line.get("duration_factor", 1))
             emotion = line.get("emotion_vector", [0] * 8)
             if len(emotion) != 8 or any(not isinstance(x, (int, float)) or not math.isfinite(x) or not 0 <= x <= 1 for x in emotion):
@@ -182,7 +184,10 @@ def compile_plan(root):
     for shot in plan["shots"]:
         sid = shot["shot_id"]
         for line in shot["lines"]:
-            tts.append({**line, "scene_id": shot["scene_id"], "shot_id": sid,
+            stable_seed = int.from_bytes(hashlib.sha256(
+                f"{line['audio_id']}\0{line['text']}".encode("utf-8")).digest()[:4], "big")
+            tts.append({**line, "seed": line.get("seed", stable_seed),
+                        "scene_id": shot["scene_id"], "shot_id": sid,
                         "reference_voice": f"voices/selected/{line['role_id']}.wav",
                         "output": f"audio/lines/{line['audio_id']}.wav", "required": True,
                         "status": "pending"})
@@ -200,7 +205,11 @@ def compile_plan(root):
             for row in rows:
                 # Adoption is allowed only when creative inputs match exactly.
                 prior = previous[row[key]]
-                fields = ("text", "role_id", "lang", "reference_voice", "output", "emotion_vector", "duration_factor") if name == "tts" else ("inputs", "workflow", "bindings", "output")
+                fields = ("text", "role_id", "lang", "reference_voice", "output", "emotion_vector", "duration_factor", "seed") if name == "tts" else ("inputs", "workflow", "bindings", "output")
+                # Seedless legacy rows adopt the deterministic seed derived
+                # from their already-frozen ID and text.
+                if name == "tts" and "seed" not in prior:
+                    prior["seed"] = row["seed"]
                 # Older manifests may omit an optional duration override even
                 # when the current workflow exposes that binding.  Preserve
                 # the Drive-side runtime configuration in this one compatible
