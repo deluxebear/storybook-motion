@@ -36,6 +36,43 @@
 
 ---
 
+## 前置条件
+
+运行流水线前，请先完成以下准备：
+
+- **本地环境**：安装并登录 Google Colab CLI **0.7.0 或更高版本**，确保可以正常执行 `colab sessions`、`colab status`、`colab drivemount` 和 `colab exec`。
+- **Google Drive**：准备一个有足够可用空间的 Google Drive；模型缓存、绘本工程和生成媒体统一存放在 `MyDrive/vidio/`。
+- **三个常驻 Colab 会话**：由用户手动创建并保持运行，流水线不会创建、启动、停止、重命名或替换这些会话。
+
+  | 会话名称 | 运行规格 | 用途 |
+  | --- | --- | --- |
+  | `voice` | L4 GPU | Qwen3-TTS VoiceDesign 角色音色设计 |
+  | `tts` | L4 GPU | IndexTTS 2.5、音频质检、时长计算和字幕强制对齐 |
+  | `ComfyUI` | A100 High-Mem | ComfyUI 视频生成及最终音画合成 |
+
+- **挂载网盘**：三个会话必须挂载**同一个 Google Drive 账号**，并能够读写 `/content/drive/MyDrive/vidio/`。可分别执行：
+
+  ```bash
+  colab drivemount -s voice
+  colab drivemount -s tts
+  colab drivemount -s ComfyUI
+  ```
+
+- **启动 ComfyUI 服务**：在 `ComfyUI` 会话中运行 [`notebooks/ComfyUIonColab_cli.ipynb`](notebooks/ComfyUIonColab_cli.ipynb)，将有效的 Cloudflare HTTPS 端点写入仓库根目录的 `url` 文件。流水线会从该文件连接 ComfyUI。
+
+启动流水线前建议确认三个会话都在线：
+
+```bash
+colab sessions
+colab status -s voice
+colab status -s tts
+colab status -s ComfyUI
+```
+
+> Colab GPU 会话可能产生费用并会因平台策略过期。请由用户自行维护其生命周期；项目不会自动降级 GPU，也不会擅自停止正在运行的会话。
+
+---
+
 ## 快速上手
 
 ```bash
