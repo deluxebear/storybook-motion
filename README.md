@@ -1,6 +1,8 @@
-# vidio - AI Animated Storybook Pipeline
+# Storybook Motion
 
-`vidio` 是一个端到端的多模态 AI 动画制作流水线，专门将开源儿童绘本（如 Book Dash、StoryWeaver 等 CC BY 4.0 绘本）转化为高品质的有声动画绘本（Animated Storybooks）。
+**Storybook Motion** 是一个端到端的多模态 AI 动画制作流水线，专门将开源儿童绘本（如 Book Dash、StoryWeaver 等 CC BY 4.0 绘本）转化为高品质的有声动画绘本（Animated Storybooks）。
+
+> 兼容性说明：Google Drive 上现有的 `MyDrive/vidio/` 路径暂时保留为内部存储命名空间，避免项目改名破坏已生成资产、模型缓存和断点恢复状态。
 
 ---
 
@@ -27,7 +29,6 @@
 
 ## 文档索引
 
-- **项目核心记忆与全景技术手册**：[PROJECT_MEMORY.md](PROJECT_MEMORY.md)
 - **AI Agent 指令与开发铁律**：[AGENTS.md](AGENTS.md)
 - **Token 优化实践案例**：[docs/ai-agent-token-optimization-colab-case.md](docs/ai-agent-token-optimization-colab-case.md)
 - **绘本动画核心技能**：[.agents/skills/bookdash-animation-pipeline/SKILL.md](.agents/skills/bookdash-animation-pipeline/SKILL.md)

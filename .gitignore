@@ -1,4 +1,5 @@
 /books/
+/.pipeline/
 /.tmp_*.py
 /notebooks/*_output.ipynb
 /.pipeline/**/status.json

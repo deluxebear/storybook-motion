@@ -24,7 +24,9 @@
    - “正常静默、异常取样”：成功仅输出结构化探针确认结果；失败仅保留末尾 20 行核心错误。
 
 3. **GPU 生命周期安全**：
-   - TTS 所需的 L4 实例独立归属各单本书，完成或失败后必须确保 `colab stop`。
+   - VoiceDesign 固定使用用户预先运行并挂载 Drive 的 L4 会话 `voice`；IndexTTS 与字幕对齐固定使用会话 `tts`。
+   - 仓库监听器使用独立的 `voice`、`tts`、`video` 单任务槽位；不同绘本可跨阶段并行。`voice_design` 已成功的绘本必须直接路由到 `tts`，不得重做音色。
+   - 流水线不得创建、挂载、停止或重命名这两个会话；只允许健康探针和任务投递。
    - ComfyUI 运行在用户指定的 A100 High-Mem 实例上，绝不擅自降级、多重创建或擅自终止用户运行中的 ComfyUI 实例。
 
 4. **数据与幂等性**：
@@ -52,8 +54,11 @@ python .agents/skills/bookdash-animation-pipeline/scripts/pipeline.py validate -
 # 编译生成运行时清单
 python .agents/skills/bookdash-animation-pipeline/scripts/pipeline.py compile --book-dir books/<book_slug>
 
-# 启动执行流水线（需在 PTY 中挂载 Drive；启动后立即返回 PID 和日志）
-python .agents/skills/bookdash-animation-pipeline/scripts/pipeline.py start --book-dir books/<book_slug> --comfy-url $(cat url)
+# 启动 books/ 常驻监听器（启动后立即返回 PID 和日志）
+python .agents/skills/bookdash-animation-pipeline/scripts/pipeline.py watch-start
+
+# 查询监听器
+python .agents/skills/bookdash-animation-pipeline/scripts/pipeline.py watch-status
 
 # 单次查询流水线状态
 python .agents/skills/bookdash-animation-pipeline/scripts/pipeline.py status --book-dir books/<book_slug>
